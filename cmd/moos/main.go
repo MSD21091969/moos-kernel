@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -161,6 +162,7 @@ func seedInfrastructure(rt *kernel.Runtime, user, ws string) error {
 				Properties: map[string]graph.Property{
 					"hostname": {Value: ws, Mutability: "immutable", StratumOrigin: graph.S2},
 					"os":       {Value: detectOS(), Mutability: "immutable", StratumOrigin: graph.S2},
+					"arch":     {Value: detectArch(), Mutability: "immutable", StratumOrigin: graph.S2},
 				},
 			},
 		},
@@ -222,4 +224,8 @@ func detectOS() string {
 		return "linux"
 	}
 	return "windows"
+}
+
+func detectArch() string {
+	return runtime.GOARCH
 }

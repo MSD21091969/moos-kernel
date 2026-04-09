@@ -1,8 +1,8 @@
 # moos-kernel
 
-Canonical reference: `ffs0/kb/research/20260402-codex-unified.md`
-Ontology: `ffs0/kb/superset/ontology.json` (v3.1)
-Gate closed: T=153
+Canonical reference: `ffs0/kb/research/20260408-foundation-t158.md`
+Ontology: `ffs0/kb/superset/ontology.json` (v3.3)
+Gate closed: T=159
 
 ---
 
@@ -24,7 +24,7 @@ UNLINK — remove one relation
 | node | object, element, vertex |
 | relation | binding, edge, wire, association |
 | rewrite | morphism, update, mutation |
-| rewrite_category (WF01-WF15) | named relation, UML association |
+| rewrite_category (WF01-WF18) | named relation, UML association |
 | property | field, payload, attribute |
 | operad | schema, grammar |
 | interaction_node | transition, event, message |
@@ -35,7 +35,7 @@ UNLINK — remove one relation
 ```
 internal/graph      — pure types (no IO): Node, Relation, Property, Rewrite, GraphState
 internal/fold       — pure catamorphism: Evaluate, Replay, EvaluateProgram
-internal/operad     — type system: Registry (WF01-WF15), ValidateLINK, ValidateMUTATE
+internal/operad     — type system: Registry (WF01-WF18), ValidateLINK, ValidateMUTATE
 internal/kernel     — effect layer: Runtime, Store, LogStore, MemStore
 internal/transport  — HTTP adapter (13 routes)
 internal/mcp        — MCP JSON-RPC 2.0 (SSE + stdio)

@@ -82,6 +82,59 @@ func TestFiedlerCheegerAndTypeCoherence(t *testing.T) {
 	}
 }
 
+func TestTypeExpressionsAndDriftFilter(t *testing.T) {
+	state := spectralSampleState()
+	expressions := hdc.TypeExpressions(state, nil)
+
+	if len(expressions) != 3 {
+		t.Fatalf("expected 3 expression rows, got %d", len(expressions))
+	}
+	for _, row := range expressions {
+		if row.URN == "" {
+			t.Fatal("expression row has empty urn")
+		}
+		if row.DeclaredType == "" {
+			t.Fatal("expression row has empty declared_type")
+		}
+		if row.ExpressedType == "" {
+			t.Fatal("expression row has empty expressed_type")
+		}
+		if len(row.Top3Types) == 0 || len(row.Top3Types) > 3 {
+			t.Fatalf("expected 1..3 top types for %s, got %d", row.URN, len(row.Top3Types))
+		}
+	}
+
+	empty := hdc.DriftedTypeExpressions(state, nil, 2.1)
+	if len(empty) != 0 {
+		t.Fatalf("expected no rows above drift threshold 2.1, got %d", len(empty))
+	}
+
+	drifted := hdc.DriftedTypeExpressions(state, nil, 0.3)
+	for _, row := range drifted {
+		if row.Drift <= 0.3 {
+			t.Fatalf("drift filter returned non-drifted row %s with drift %f", row.URN, row.Drift)
+		}
+	}
+}
+
+func TestLiveIndex_RecomputeAndDrifted(t *testing.T) {
+	state := spectralSampleState()
+	idx := hdc.NewLiveIndex(0.3)
+	idx.Recompute(state, nil)
+
+	expressions := idx.Expressions()
+	if len(expressions) != 3 {
+		t.Fatalf("expected 3 indexed expression rows, got %d", len(expressions))
+	}
+
+	drifted := idx.Drifted()
+	for _, row := range drifted {
+		if row.Drift <= 0.3 {
+			t.Fatalf("drifted index returned row below threshold: %s (%f)", row.URN, row.Drift)
+		}
+	}
+}
+
 func spectralSampleState() graph.GraphState {
 	state := graph.NewGraphState()
 

@@ -1,14 +1,19 @@
 package kernel
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"moos/kernel/internal/fold"
 	"moos/kernel/internal/graph"
+	"moos/kernel/internal/hdc"
 	"moos/kernel/internal/operad"
 	"moos/kernel/internal/reactive"
 )
@@ -29,6 +34,7 @@ type Runtime struct {
 	log      []graph.PersistedRewrite
 	store    Store
 	registry *operad.Registry
+	hdcIndex *hdc.LiveIndex
 
 	subscriberMu sync.Mutex
 	subscribers  map[string]chan graph.PersistedRewrite
@@ -54,11 +60,13 @@ func NewRuntime(store Store, registry *operad.Registry) (*Runtime, error) {
 		log:         entries,
 		store:       store,
 		registry:    registry,
+		hdcIndex:    hdc.NewLiveIndex(0.3),
 		subscribers: make(map[string]chan graph.PersistedRewrite),
 	}
 	if len(entries) > 0 {
 		rt.logSeq.Store(entries[len(entries)-1].LogSeq)
 	}
+	rt.hdcIndex.Recompute(state, nil)
 	return rt, nil
 }
 
@@ -107,6 +115,7 @@ func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
 	rt.log = append(rt.log, persisted)
 	rt.broadcast(persisted)
 	rt.runReactive(persisted)
+	rt.runHDCIndexAndDriftLocked(env)
 
 	return result, nil
 }
@@ -162,6 +171,9 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 	rt.log = append(rt.log, persisted...)
 	for _, p := range persisted {
 		rt.broadcast(p)
+	}
+	if len(envelopes) > 0 {
+		rt.runHDCIndexAndDriftLocked(envelopes[len(envelopes)-1])
 	}
 	return results, nil
 }
@@ -259,6 +271,16 @@ func (rt *Runtime) LogLen() int {
 	return len(rt.log)
 }
 
+// HDCTypeExpressions returns a snapshot of the live in-memory type-expression index.
+func (rt *Runtime) HDCTypeExpressions() []hdc.TypeExpressionEntry {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.hdcIndex == nil {
+		return nil
+	}
+	return rt.hdcIndex.Expressions()
+}
+
 // --- ObservableKernel ---
 
 func (rt *Runtime) Subscribe(id string) <-chan graph.PersistedRewrite {
@@ -339,6 +361,144 @@ func (rt *Runtime) applyReactiveLocked(env graph.Envelope) {
 	rt.state = next
 	rt.log = append(rt.log, persisted)
 	rt.broadcast(persisted)
+}
+
+// runHDCIndexAndDriftLocked updates the in-memory HDC index and emits type-drift claims.
+// Called with rt.mu already held.
+func (rt *Runtime) runHDCIndexAndDriftLocked(trigger graph.Envelope) {
+	if rt.hdcIndex == nil {
+		return
+	}
+
+	switch trigger.RewriteType {
+	case graph.ADD, graph.LINK, graph.UNLINK, graph.MUTATE:
+		// continue
+	default:
+		return
+	}
+
+	rt.hdcIndex.Recompute(rt.state, nil)
+	drifted := rt.hdcIndex.Drifted()
+	if len(drifted) == 0 {
+		return
+	}
+
+	actor := rt.hdcActorURN(trigger.Actor)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	for _, row := range drifted {
+		if strings.HasPrefix(row.URN.String(), "urn:moos:claim:type-drift.") {
+			continue
+		}
+		if row.DeclaredType == "claim" {
+			continue
+		}
+
+		hash := shortHash(row.URN.String())
+		claimURN := graph.URN("urn:moos:claim:type-drift." + hash)
+		if _, exists := rt.state.Nodes[claimURN]; exists {
+			continue
+		}
+
+		confidence := row.Drift
+		if confidence < 0 {
+			confidence = 0
+		}
+		if confidence > 1 {
+			confidence = 1
+		}
+
+		addClaim := graph.Envelope{
+			RewriteType: graph.ADD,
+			Actor:       actor,
+			NodeURN:     claimURN,
+			TypeID:      "claim",
+			Properties: map[string]graph.Property{
+				"text": {
+					Value:      fmt.Sprintf("type drift detected for %s", row.URN),
+					Mutability: "immutable",
+				},
+				"created_at": {
+					Value:      now,
+					Mutability: "immutable",
+				},
+				"source_ki_urn": {
+					Value:      "urn:moos:ki:system.hdc-drift",
+					Mutability: "immutable",
+				},
+				"confidence": {
+					Value:          confidence,
+					Mutability:     "mutable",
+					AuthorityScope: "kernel",
+				},
+				"subject_urn": {
+					Value:      row.URN.String(),
+					Mutability: "immutable",
+				},
+				"declared_type": {
+					Value:      string(row.DeclaredType),
+					Mutability: "immutable",
+				},
+				"expressed_type": {
+					Value:      string(row.ExpressedType),
+					Mutability: "immutable",
+				},
+				"drift_score": {
+					Value:          row.Drift,
+					Mutability:     "mutable",
+					AuthorityScope: "kernel",
+				},
+			},
+		}
+		rt.applyReactiveLocked(addClaim)
+
+		relURN := graph.URN("urn:moos:rel:type-drift." + hash + ".annotation")
+		if _, exists := rt.state.Relations[relURN]; exists {
+			continue
+		}
+
+		linkClaim := graph.Envelope{
+			RewriteType:     graph.LINK,
+			RewriteCategory: graph.WF11,
+			Actor:           actor,
+			RelationURN:     relURN,
+			SrcURN:          claimURN,
+			SrcPort:         "tagged",
+			TgtURN:          row.URN,
+			TgtPort:         "tagged-in",
+		}
+		rt.applyReactiveLocked(linkClaim)
+	}
+
+	rt.hdcIndex.Recompute(rt.state, nil)
+}
+
+func (rt *Runtime) hdcActorURN(defaultActor graph.URN) graph.URN {
+	if strings.HasPrefix(defaultActor.String(), "urn:moos:kernel:") {
+		return defaultActor
+	}
+
+	kernels := make([]string, 0)
+	for urn, node := range rt.state.Nodes {
+		if node.TypeID == "kernel" {
+			kernels = append(kernels, urn.String())
+		}
+	}
+	if len(kernels) == 0 {
+		return defaultActor
+	}
+	sort.Strings(kernels)
+	for _, urn := range kernels {
+		if strings.HasSuffix(urn, ".primary") {
+			return graph.URN(urn)
+		}
+	}
+	return graph.URN(kernels[0])
+}
+
+func shortHash(s string) string {
+	sum := sha1.Sum([]byte(s))
+	return hex.EncodeToString(sum[:6])
 }
 
 // validate dispatches to the appropriate operad validator by rewrite type.

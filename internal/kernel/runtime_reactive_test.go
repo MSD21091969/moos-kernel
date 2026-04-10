@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"moos/kernel/internal/graph"
+	"moos/kernel/internal/hdc"
 )
 
 // TestRuntime_ReactiveChain verifies that Apply triggers the reactive engine
@@ -115,5 +116,101 @@ func TestRuntime_ReactiveChain(t *testing.T) {
 	status, _ := ki.Properties["status"].Value.(string)
 	if status != "claim-pending" {
 		t.Errorf("expected KI status=claim-pending, got %q", status)
+	}
+}
+
+func TestRuntime_HDCDriftEmitsClaimAndAnnotation(t *testing.T) {
+	rt := &Runtime{
+		state:       graph.NewGraphState(),
+		store:       NewMemStore(),
+		registry:    nil,
+		hdcIndex:    hdc.NewLiveIndex(1.1),
+		subscribers: make(map[string]chan graph.PersistedRewrite),
+	}
+
+	adds := []graph.Envelope{
+		{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:kernel:test",
+			NodeURN:     "urn:moos:ki:a",
+			TypeID:      "knowledge_item",
+			Properties: map[string]graph.Property{
+				"title":  {Value: "Alpha", Mutability: "immutable"},
+				"status": {Value: "raw", Mutability: "mutable"},
+			},
+		},
+		{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:kernel:test",
+			NodeURN:     "urn:moos:ki:b",
+			TypeID:      "knowledge_item",
+			Properties: map[string]graph.Property{
+				"title":  {Value: "Beta", Mutability: "immutable"},
+				"status": {Value: "raw", Mutability: "mutable"},
+			},
+		},
+	}
+
+	for _, env := range adds {
+		if _, err := rt.Apply(env); err != nil {
+			t.Fatalf("apply add failed: %v", err)
+		}
+	}
+
+	expressions := rt.HDCTypeExpressions()
+	var maxDrift float64
+	for _, row := range expressions {
+		if row.DeclaredType == "claim" {
+			continue
+		}
+		if row.Drift > maxDrift {
+			maxDrift = row.Drift
+		}
+	}
+	if maxDrift <= 0 {
+		t.Fatalf("expected positive drift score from type-expression index, got %f", maxDrift)
+	}
+
+	rt.mu.Lock()
+	rt.hdcIndex = hdc.NewLiveIndex(maxDrift * 0.5)
+	rt.hdcIndex.Recompute(rt.state, nil)
+	rt.mu.Unlock()
+
+	if _, err := rt.Apply(graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:kernel:test",
+		TargetURN:   "urn:moos:ki:a",
+		Field:       "status",
+		NewValue:    "claim-pending",
+	}); err != nil {
+		t.Fatalf("apply mutate trigger failed: %v", err)
+	}
+
+	var claimCount int
+	for _, n := range rt.state.Nodes {
+		if n.TypeID == "claim" {
+			claimCount++
+			if _, ok := n.Properties["subject_urn"]; !ok {
+				t.Fatal("drift claim missing subject_urn")
+			}
+		}
+	}
+	if claimCount == 0 {
+		t.Fatal("expected at least one drift claim node")
+	}
+
+	var annotationCount int
+	for _, rel := range rt.state.Relations {
+		if rel.RewriteCategory == graph.WF11 {
+			annotationCount++
+		}
+	}
+	if annotationCount == 0 {
+		t.Fatal("expected at least one WF11 drift annotation relation")
+	}
+
+	expressions = rt.HDCTypeExpressions()
+	if len(expressions) == 0 {
+		t.Fatal("expected non-empty HDC type-expression index")
 	}
 }

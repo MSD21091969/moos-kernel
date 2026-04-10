@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 // Transport receives requests, converts them to Envelopes, calls Apply,
 // and returns results. It has no business logic.
 type Server struct {
+	rt       *kernel.Runtime
 	inspect  kernel.InspectKernel
 	write    kernel.WriteKernel
 	observe  kernel.ObservableKernel
@@ -31,7 +33,7 @@ var tDay0 = time.Date(2025, 10, 31, 23, 0, 0, 0, time.UTC)
 func currentTDay() int { return int(time.Now().UTC().Sub(tDay0).Hours() / 24) }
 
 func NewServer(rt *kernel.Runtime, registry *operad.Registry, _ int) *Server {
-	return &Server{inspect: rt, write: rt, observe: rt, registry: registry}
+	return &Server{rt: rt, inspect: rt, write: rt, observe: rt, registry: registry}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -59,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /hdc/eigenvalues", s.handleGetHDCEigenvalues)
 	mux.HandleFunc("GET /hdc/fiedler", s.handleGetHDCFiedler)
 	mux.HandleFunc("GET /hdc/type-coherence", s.handleGetHDCTypeCoherence)
+	mux.HandleFunc("GET /hdc/type-expression", s.handleGetHDCTypeExpression)
 
 	return mux
 }
@@ -238,6 +241,58 @@ func (s *Server) handleGetHDCFiedler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetHDCTypeCoherence(w http.ResponseWriter, r *http.Request) {
 	state := s.inspect.State()
 	writeJSON(w, http.StatusOK, hdc.TypeCoherence(state, nil))
+}
+
+func (s *Server) handleGetHDCTypeExpression(w http.ResponseWriter, r *http.Request) {
+	rows := s.rt.HDCTypeExpressions()
+	if len(rows) == 0 {
+		state := s.inspect.State()
+		rows = hdc.TypeExpressions(state, nil)
+	}
+
+	threshold := -1.0
+	if raw := strings.TrimSpace(r.URL.Query().Get("threshold")); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid threshold")
+			return
+		}
+		threshold = parsed
+	}
+
+	if threshold >= 0 {
+		filtered := make([]hdc.TypeExpressionEntry, 0, len(rows))
+		for _, row := range rows {
+			if row.Drift > threshold {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+	}
+
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("sort")), "drift") {
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].Drift == rows[j].Drift {
+				return rows[i].URN < rows[j].URN
+			}
+			return rows[i].Drift > rows[j].Drift
+		})
+	}
+
+	top := -1
+	if raw := strings.TrimSpace(r.URL.Query().Get("top")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid top")
+			return
+		}
+		top = parsed
+	}
+	if top > 0 && top < len(rows) {
+		rows = rows[:top]
+	}
+
+	writeJSON(w, http.StatusOK, rows)
 }
 
 // --- Helpers ---

@@ -26,6 +26,19 @@ type TypeDrift struct {
 	DriftScore float64   `json:"drift_score"`
 }
 
+type TypeScore struct {
+	TypeID graph.TypeID `json:"type_id"`
+	Cos    float64      `json:"cos"`
+}
+
+type TypeExpressionEntry struct {
+	URN           graph.URN    `json:"urn"`
+	DeclaredType  graph.TypeID `json:"declared_type"`
+	ExpressedType graph.TypeID `json:"expressed_type"`
+	Drift         float64      `json:"drift"`
+	Top3Types     []TypeScore  `json:"top3_types"`
+}
+
 type TypeCoherenceEntry struct {
 	TypeID       graph.TypeID `json:"type_id"`
 	CentroidNorm float64      `json:"centroid_norm"`
@@ -273,6 +286,106 @@ func TypeCoherence(state graph.GraphState, enc *Encoder) []TypeCoherenceEntry {
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].TypeID < out[j].TypeID })
+	return out
+}
+
+// TypeExpressions computes declared/expression type alignment for each node.
+func TypeExpressions(state graph.GraphState, enc *Encoder) []TypeExpressionEntry {
+	embeddings := embeddingsFromState(state, enc)
+	if len(embeddings) == 0 {
+		return nil
+	}
+
+	groups := make(map[graph.TypeID][]nodeEmbedding)
+	for _, e := range embeddings {
+		groups[e.typeID] = append(groups[e.typeID], e)
+	}
+
+	centroids := make(map[graph.TypeID]HV, len(groups))
+	typeIDs := make([]graph.TypeID, 0, len(groups))
+	for typeID, group := range groups {
+		typeIDs = append(typeIDs, typeID)
+		var raw HV
+		for _, e := range group {
+			for i := 0; i < Dimension; i++ {
+				raw[i] += e.vector[i]
+			}
+		}
+		norm := l2Norm(raw)
+		centroid := raw
+		if norm > eps {
+			inv := float32(1.0 / norm)
+			for i := 0; i < Dimension; i++ {
+				centroid[i] *= inv
+			}
+		}
+		centroids[typeID] = centroid
+	}
+	sort.Slice(typeIDs, func(i, j int) bool { return typeIDs[i] < typeIDs[j] })
+
+	out := make([]TypeExpressionEntry, 0, len(embeddings))
+	for _, e := range embeddings {
+		scores := make([]TypeScore, 0, len(typeIDs))
+		for _, typeID := range typeIDs {
+			cos := float64(Cosine(e.vector, centroids[typeID]))
+			scores = append(scores, TypeScore{TypeID: typeID, Cos: cos})
+		}
+		sort.Slice(scores, func(i, j int) bool {
+			if scores[i].Cos == scores[j].Cos {
+				return scores[i].TypeID < scores[j].TypeID
+			}
+			return scores[i].Cos > scores[j].Cos
+		})
+
+		expressed := e.typeID
+		if len(scores) > 0 {
+			expressed = scores[0].TypeID
+		}
+
+		drift := 1.0
+		if declaredCentroid, ok := centroids[e.typeID]; ok {
+			drift = 1 - float64(Cosine(e.vector, declaredCentroid))
+		}
+
+		top := scores
+		if len(top) > 3 {
+			top = top[:3]
+		}
+		copiedTop := make([]TypeScore, len(top))
+		copy(copiedTop, top)
+
+		out = append(out, TypeExpressionEntry{
+			URN:           e.urn,
+			DeclaredType:  e.typeID,
+			ExpressedType: expressed,
+			Drift:         drift,
+			Top3Types:     copiedTop,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].URN == out[j].URN {
+			return out[i].Drift > out[j].Drift
+		}
+		return out[i].URN < out[j].URN
+	})
+
+	return out
+}
+
+// DriftedTypeExpressions filters expressions to rows above a given drift threshold.
+func DriftedTypeExpressions(state graph.GraphState, enc *Encoder, threshold float64) []TypeExpressionEntry {
+	if threshold <= 0 {
+		threshold = 0.3
+	}
+
+	all := TypeExpressions(state, enc)
+	out := make([]TypeExpressionEntry, 0, len(all))
+	for _, row := range all {
+		if row.Drift > threshold {
+			out = append(out, row)
+		}
+	}
 	return out
 }
 

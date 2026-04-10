@@ -80,6 +80,9 @@ func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
 			if err := rt.registry.ValidateMUTATE(env, node); err != nil {
 				return graph.EvalResult{}, err
 			}
+			// Additive MUTATE: inject PropertySpec for fields declared in ontology but not yet on node.
+			// This allows new optional properties (added in later ontology versions) to be set on existing nodes.
+			env = rt.injectPropertySpec(env, node)
 		}
 	}
 
@@ -119,6 +122,19 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+
+	// Inject PropertySpec for additive MUTATEs against the current state.
+	// We walk the envelopes; the state evolves as we go (best-effort — use current state).
+	injected := make([]graph.Envelope, len(envelopes))
+	for i, env := range envelopes {
+		if env.RewriteType == graph.MUTATE && rt.registry != nil {
+			if node, ok := rt.state.Nodes[env.TargetURN]; ok {
+				env = rt.injectPropertySpec(env, node)
+			}
+		}
+		injected[i] = env
+	}
+	envelopes = injected
 
 	nextState, results, err := fold.EvaluateProgram(rt.state, envelopes)
 	if err != nil {
@@ -342,4 +358,30 @@ func (rt *Runtime) validate(env graph.Envelope) error {
 		return nil
 	}
 	return nil
+}
+
+// injectPropertySpec handles additive MUTATE: if the target field is not on the node but IS
+// declared as mutable in the ontology type definition, inject the PropertySpec so fold can create it.
+// This allows new optional properties (added in later ontology versions) to be set on existing nodes.
+func (rt *Runtime) injectPropertySpec(env graph.Envelope, node graph.Node) graph.Envelope {
+	if env.PropertySpec != nil {
+		return env // already set (e.g. during replay)
+	}
+	if _, hasProp := node.Properties[env.Field]; hasProp {
+		return env // field already on node — standard MUTATE path
+	}
+	typeSpec, hasType := rt.registry.NodeTypes[node.TypeID]
+	if !hasType {
+		return env
+	}
+	pspec, hasPspec := typeSpec.Properties[env.Field]
+	if !hasPspec || pspec.Mutability != "mutable" {
+		return env
+	}
+	env.PropertySpec = &graph.Property{
+		Mutability:     pspec.Mutability,
+		AuthorityScope: pspec.AuthorityScope,
+		StratumOrigin:  2,
+	}
+	return env
 }

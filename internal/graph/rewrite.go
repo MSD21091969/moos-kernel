@@ -43,10 +43,11 @@ type Envelope struct {
 	ContractURN     URN             `json:"contract_urn,omitempty"` // required for WF15
 
 	// MUTATE fields
-	TargetURN       URN    `json:"target_urn,omitempty"`
-	Field           string `json:"field,omitempty"`
-	NewValue        any    `json:"new_value,omitempty"`
-	ExpectedVersion int64  `json:"expected_version,omitempty"` // 0 = skip CAS
+	TargetURN       URN      `json:"target_urn,omitempty"`
+	Field           string   `json:"field,omitempty"`
+	NewValue        any      `json:"new_value,omitempty"`
+	ExpectedVersion int64    `json:"expected_version,omitempty"` // 0 = skip CAS
+	PropertySpec    *Property `json:"property_spec,omitempty"`   // injected for additive MUTATE (field not yet on node)
 }
 
 // EvalResult is the outcome of applying a single Envelope.

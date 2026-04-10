@@ -90,7 +90,23 @@ func applyMUTATE(state graph.GraphState, env graph.Envelope) (graph.GraphState, 
 
 	prop, hasProp := node.Properties[env.Field]
 	if !hasProp {
-		return state, graph.EvalResult{}, fmt.Errorf("%w: field %q not found on node %s", ErrFieldNotInScope, env.Field, env.TargetURN)
+		// Additive MUTATE: field not yet on this node — use injected PropertySpec from runtime
+		// (runtime validates against ontology and injects spec for new optional properties).
+		if env.PropertySpec == nil {
+			return state, graph.EvalResult{}, fmt.Errorf("%w: field %q not found on node %s", ErrFieldNotInScope, env.Field, env.TargetURN)
+		}
+		next := state.Clone()
+		mutated := next.Nodes[env.TargetURN]
+		mutated.Version++
+		mutated.Properties[env.Field] = graph.Property{
+			Value:          env.NewValue,
+			Mutability:     env.PropertySpec.Mutability,
+			AuthorityScope: env.PropertySpec.AuthorityScope,
+			StratumOrigin:  env.PropertySpec.StratumOrigin,
+			ValidationType: env.PropertySpec.ValidationType,
+		}
+		next.Nodes[env.TargetURN] = mutated
+		return next, graph.EvalResult{AffectedNodeURN: env.TargetURN}, nil
 	}
 	if prop.Immutable() {
 		return state, graph.EvalResult{}, fmt.Errorf("%w: field %q on node %s", ErrImmutableProperty, env.Field, env.TargetURN)

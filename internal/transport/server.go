@@ -62,6 +62,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /hdc/fiedler", s.handleGetHDCFiedler)
 	mux.HandleFunc("GET /hdc/type-coherence", s.handleGetHDCTypeCoherence)
 	mux.HandleFunc("GET /hdc/type-expression", s.handleGetHDCTypeExpression)
+	mux.HandleFunc("GET /hdc/fiber", s.handleGetHDCFiber)
+	mux.HandleFunc("GET /hdc/federation", s.handleGetHDCFederation)
+	mux.HandleFunc("GET /hdc/fiber-assignment", s.handleGetHDCFiberAssignment)
+	mux.HandleFunc("GET /hdc/fiber-distribution", s.handleGetHDCFiberDistribution)
 
 	return mux
 }
@@ -293,6 +297,72 @@ func (s *Server) handleGetHDCTypeExpression(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, rows)
+}
+
+func (s *Server) handleGetHDCFiber(w http.ResponseWriter, r *http.Request) {
+	kernelURN := graph.URN(strings.TrimSpace(r.URL.Query().Get("kernel")))
+	if kernelURN == "" {
+		writeError(w, http.StatusBadRequest, "missing kernel query parameter")
+		return
+	}
+
+	state := s.inspect.State()
+	node, ok := state.Nodes[kernelURN]
+	if !ok || node.TypeID != "kernel" {
+		writeError(w, http.StatusNotFound, "kernel not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, hdc.FiberVectorForKernel(state, kernelURN, nil))
+}
+
+func (s *Server) handleGetHDCFederation(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	writeJSON(w, http.StatusOK, hdc.FederationVector(state, nil))
+}
+
+func (s *Server) handleGetHDCFiberAssignment(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	rows := hdc.FiberAssignments(state, nil)
+
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("only_misplaced")), "true") {
+		filtered := make([]hdc.FiberAssignmentEntry, 0, len(rows))
+		for _, row := range rows {
+			if row.CurrentKernel != row.OptimalKernel {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+	}
+
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("sort")), "distance") {
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].Distance == rows[j].Distance {
+				return rows[i].URN < rows[j].URN
+			}
+			return rows[i].Distance > rows[j].Distance
+		})
+	}
+
+	top := -1
+	if raw := strings.TrimSpace(r.URL.Query().Get("top")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid top")
+			return
+		}
+		top = parsed
+	}
+	if top > 0 && top < len(rows) {
+		rows = rows[:top]
+	}
+
+	writeJSON(w, http.StatusOK, rows)
+}
+
+func (s *Server) handleGetHDCFiberDistribution(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	writeJSON(w, http.StatusOK, hdc.FiberDistribution(state))
 }
 
 // --- Helpers ---

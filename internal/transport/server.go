@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"moos/kernel/internal/graph"
+	"moos/kernel/internal/hdc"
 	"moos/kernel/internal/kernel"
 	"moos/kernel/internal/operad"
 )
@@ -52,6 +54,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /operad/node-types", s.handleGetNodeTypes)
 	mux.HandleFunc("GET /operad/rewrite-categories", s.handleGetRewriteCategories)
 	mux.HandleFunc("GET /operad/port-colors", s.handleGetPortColors)
+
+	mux.HandleFunc("GET /hdc/similarity-matrix", s.handleGetHDCSimilarityMatrix)
+	mux.HandleFunc("GET /hdc/eigenvalues", s.handleGetHDCEigenvalues)
+	mux.HandleFunc("GET /hdc/fiedler", s.handleGetHDCFiedler)
+	mux.HandleFunc("GET /hdc/type-coherence", s.handleGetHDCTypeCoherence)
 
 	return mux
 }
@@ -191,6 +198,46 @@ func (s *Server) handleGetPortColors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.registry.PortColorMatrix)
+}
+
+// --- HDC ---
+
+func (s *Server) handleGetHDCSimilarityMatrix(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	_, _, _, entries := hdc.SimilarityMatrix(state, nil)
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) handleGetHDCEigenvalues(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	_, _, similarity, _ := hdc.SimilarityMatrix(state, nil)
+	laplacian := hdc.Laplacian(similarity)
+	values, _ := hdc.EigenDecompositionSymmetric(laplacian)
+
+	top := 10
+	if raw := strings.TrimSpace(r.URL.Query().Get("top")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err == nil && parsed > 0 {
+			top = parsed
+		}
+	}
+	if top > len(values) {
+		top = len(values)
+	}
+	writeJSON(w, http.StatusOK, values[:top])
+}
+
+func (s *Server) handleGetHDCFiedler(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	urns, _, similarity, _ := hdc.SimilarityMatrix(state, nil)
+	laplacian := hdc.Laplacian(similarity)
+	values, vectors := hdc.EigenDecompositionSymmetric(laplacian)
+	writeJSON(w, http.StatusOK, hdc.FiedlerPartition(urns, values, vectors))
+}
+
+func (s *Server) handleGetHDCTypeCoherence(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	writeJSON(w, http.StatusOK, hdc.TypeCoherence(state, nil))
 }
 
 // --- Helpers ---

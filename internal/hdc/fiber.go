@@ -55,8 +55,10 @@ func EncodeFiber(state graph.GraphState, kernelURN graph.URN, enc *Encoder) HV {
 	}
 	nodeURNs := NodesInKernel(state, kernelURN)
 	vectors := make([]HV, 0, len(nodeURNs))
+	
+	encodedBatch := enc.EncodeNodes(state, nodeURNs)
 	for _, urn := range nodeURNs {
-		vectors = append(vectors, enc.EncodeNode(state, urn))
+		vectors = append(vectors, encodedBatch[urn])
 	}
 	return Bundle(vectors...)
 }
@@ -121,10 +123,11 @@ func FiberAssignments(state graph.GraphState, enc *Encoder) []FiberAssignmentEnt
 	sort.Slice(urns, func(i, j int) bool { return urns[i] < urns[j] })
 
 	out := make([]FiberAssignmentEntry, 0, len(urns))
+	encodedBatch := enc.EncodeNodes(state, urns)
 	for _, urn := range urns {
 		node := state.Nodes[urn]
 		current := inferCurrentKernel(state, kernels, urn, node)
-		nodeVec := enc.EncodeNode(state, urn)
+		nodeVec := encodedBatch[urn]
 
 		bestKernel := kernels[0]
 		bestDistance := l2Distance(nodeVec, fibers[bestKernel])
@@ -277,7 +280,7 @@ func shardPrefixToKernelMap(state graph.GraphState, kernels []graph.URN) map[str
 	}
 
 	out := make(map[string]graph.URN)
-	for _, node := range state.Nodes {
+	for shardURN, node := range state.Nodes {
 		if node.TypeID != "shard_rule" {
 			continue
 		}
@@ -289,8 +292,13 @@ func shardPrefixToKernelMap(state graph.GraphState, kernels []graph.URN) map[str
 		if !ok || strings.TrimSpace(prefix) == "" {
 			continue
 		}
-		if kernelURN, hit := kernelSet[prefix]; hit {
-			out[prefix] = kernelURN
+		
+		for _, rel := range state.Relations {
+			if rel.SrcURN == shardURN && rel.SrcPort == "routes-to" {
+				if kernelURN, hit := kernelSet[rel.TgtURN.String()]; hit {
+					out[prefix] = kernelURN
+				}
+			}
 		}
 	}
 	return out

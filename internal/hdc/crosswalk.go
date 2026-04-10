@@ -80,24 +80,36 @@ func CrosswalkCompositionChecks(state graph.GraphState, enc *Encoder) []Composit
 		return nil
 	}
 
+	nNames := len(names)
+	reducedVecs := make([][]float64, nNames)
+	for i, name := range names {
+		reducedVecs[i] = reduceHV(schemes[name].Vector, crosswalkDim)
+	}
+
+	R := make([][][][]float64, nNames)
+	for i := 0; i < nNames; i++ {
+		R[i] = make([][][]float64, nNames)
+		for j := 0; j < nNames; j++ {
+			if i != j {
+				R[i][j] = OrthogonalRotation(reducedVecs[i], reducedVecs[j])
+			}
+		}
+	}
+
 	out := make([]CompositionCheckEntry, 0)
-	for i := 0; i < len(names); i++ {
-		for j := 0; j < len(names); j++ {
+	for i := 0; i < nNames; i++ {
+		for j := 0; j < nNames; j++ {
 			if i == j {
 				continue
 			}
-			for k := 0; k < len(names); k++ {
+			for k := 0; k < nNames; k++ {
 				if k == i || k == j {
 					continue
 				}
 
-				a := reduceHV(schemes[names[i]].Vector, crosswalkDim)
-				b := reduceHV(schemes[names[j]].Vector, crosswalkDim)
-				c := reduceHV(schemes[names[k]].Vector, crosswalkDim)
-
-				rab := OrthogonalRotation(a, b)
-				rbc := OrthogonalRotation(b, c)
-				rac := OrthogonalRotation(a, c)
+				rab := R[i][j]
+				rbc := R[j][k]
+				rac := R[i][k]
 				composed := matMul(rbc, rab)
 				err := normalizedMatrixError(composed, rac)
 
@@ -182,8 +194,7 @@ func ClassificationSpace(state graph.GraphState, enc *Encoder) ClassificationSpa
 		matrix[i] = reduceHV(schemes[name].Vector, dim)
 	}
 
-	centered, means := centerRows(matrix)
-	_ = means
+	centered, _ := centerRows(matrix)
 	cov := covariance(centered)
 	eigvals, eigvecs := EigenDecompositionSymmetric(cov)
 
@@ -222,19 +233,26 @@ func SchemeVectors(state graph.GraphState, enc *Encoder) map[string]SchemeVector
 
 	groups := make(map[string][]graph.URN)
 	for urn, node := range state.Nodes {
-		scheme := schemeNameForNode(urn, node)
+		n := node
+		scheme := InferScheme(urn, &n)
 		if scheme == "" {
 			continue
 		}
 		groups[scheme] = append(groups[scheme], urn)
 	}
 
+	allURNs := make([]graph.URN, 0)
+	for _, members := range groups {
+		allURNs = append(allURNs, members...)
+	}
+	encodedBatch := enc.EncodeNodes(state, allURNs)
+
 	out := make(map[string]SchemeVector, len(groups))
 	for scheme, members := range groups {
 		sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
 		vectors := make([]HV, 0, len(members))
 		for _, urn := range members {
-			vectors = append(vectors, enc.EncodeNode(state, urn))
+			vectors = append(vectors, encodedBatch[urn])
 		}
 		out[scheme] = SchemeVector{
 			Name:    scheme,
@@ -246,12 +264,15 @@ func SchemeVectors(state graph.GraphState, enc *Encoder) map[string]SchemeVector
 	return out
 }
 
-func schemeNameForNode(urn graph.URN, node graph.Node) string {
-	if p, ok := node.Properties["scheme"]; ok {
-		if s, ok := p.Value.(string); ok {
-			s = strings.TrimSpace(strings.ToLower(s))
-			if s != "" {
-				return s
+// InferScheme extracts the ontology classification scheme from node properties or URN substring.
+func InferScheme(urn graph.URN, node *graph.Node) string {
+	if node != nil {
+		if p, ok := node.Properties["scheme"]; ok {
+			if s, ok := p.Value.(string); ok {
+				s = strings.TrimSpace(strings.ToLower(s))
+				if s != "" {
+					return s
+				}
 			}
 		}
 	}
@@ -272,8 +293,19 @@ func explicitCrosswalkPairs(state graph.GraphState) map[string]struct{} {
 		if !looksLikeCrosswalkRelation(rel) {
 			continue
 		}
-		a := inferSchemeFromURN(rel.SrcURN)
-		b := inferSchemeFromURN(rel.TgtURN)
+		srcNode, srcOk := state.Nodes[rel.SrcURN]
+		tgtNode, tgtOk := state.Nodes[rel.TgtURN]
+		
+		var srcPtr, tgtPtr *graph.Node
+		if srcOk {
+			srcPtr = &srcNode
+		}
+		if tgtOk {
+			tgtPtr = &tgtNode
+		}
+
+		a := InferScheme(rel.SrcURN, srcPtr)
+		b := InferScheme(rel.TgtURN, tgtPtr)
 		if a == "" || b == "" || a == b {
 			continue
 		}
@@ -289,17 +321,6 @@ func looksLikeCrosswalkRelation(rel graph.Relation) bool {
 	}
 	text := strings.ToLower(rel.URN.String() + ":" + rel.SrcPort + ":" + rel.TgtPort)
 	return strings.Contains(text, "crosswalk") || strings.Contains(text, "map") || strings.Contains(text, "align")
-}
-
-func inferSchemeFromURN(urn graph.URN) string {
-	u := strings.ToLower(urn.String())
-	known := []string{"arxiv", "lcc", "ifrs", "iso", "dewey"}
-	for _, k := range known {
-		if strings.Contains(u, k) {
-			return k
-		}
-	}
-	return ""
 }
 
 func orderedPair(a, b string) string {

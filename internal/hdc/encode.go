@@ -87,6 +87,51 @@ func (e *Encoder) EncodeNode(state graph.GraphState, urn graph.URN) HV {
 	return Bundle(vectors...)
 }
 
+func (e *Encoder) EncodeNodes(state graph.GraphState, urns []graph.URN) map[graph.URN]HV {
+	adj := make(map[graph.URN][]graph.Relation)
+	for _, rel := range state.Relations {
+		adj[rel.SrcURN] = append(adj[rel.SrcURN], rel)
+		if rel.SrcURN != rel.TgtURN {
+			adj[rel.TgtURN] = append(adj[rel.TgtURN], rel)
+		}
+	}
+
+	cb := e.Codebook
+	out := make(map[graph.URN]HV, len(urns))
+
+	for _, urn := range urns {
+		node, ok := state.Nodes[urn]
+		if !ok {
+			out[urn] = HV{}
+			continue
+		}
+
+		typeVec := Bind(cb.Encode(roleTypeURN), cb.Encode(tokenURN("type", string(node.TypeID))))
+		selfVec := Bind(cb.Encode(roleSelfURN), cb.Encode(urn))
+
+		rels := adj[urn]
+		vectors := make([]HV, 0, typeWeight+1+len(rels))
+		for i := 0; i < typeWeight; i++ {
+			vectors = append(vectors, typeVec)
+		}
+		vectors = append(vectors, selfVec)
+
+		for _, rel := range rels {
+			wire := e.EncodeRelation(rel)
+			if rel.SrcURN == urn {
+				wire = Bind(cb.Encode(dirOutURN), wire)
+			} else {
+				wire = Bind(cb.Encode(dirInURN), wire)
+			}
+			vectors = append(vectors, wire)
+		}
+
+		out[urn] = Bundle(vectors...)
+	}
+
+	return out
+}
+
 func tokenURN(prefix, value string) graph.URN {
 	v := strings.ToLower(strings.TrimSpace(value))
 	if v == "" {

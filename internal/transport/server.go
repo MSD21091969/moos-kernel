@@ -66,6 +66,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /hdc/federation", s.handleGetHDCFederation)
 	mux.HandleFunc("GET /hdc/fiber-assignment", s.handleGetHDCFiberAssignment)
 	mux.HandleFunc("GET /hdc/fiber-distribution", s.handleGetHDCFiberDistribution)
+	mux.HandleFunc("GET /hdc/crosswalk", s.handleGetHDCCrosswalk)
+	mux.HandleFunc("GET /hdc/crosswalk/composition-check", s.handleGetHDCCrosswalkComposition)
+	mux.HandleFunc("GET /hdc/crosswalk/suggestions", s.handleGetHDCCrosswalkSuggestions)
+	mux.HandleFunc("GET /hdc/classification-space", s.handleGetHDCClassificationSpace)
 
 	return mux
 }
@@ -363,6 +367,63 @@ func (s *Server) handleGetHDCFiberAssignment(w http.ResponseWriter, r *http.Requ
 func (s *Server) handleGetHDCFiberDistribution(w http.ResponseWriter, r *http.Request) {
 	state := s.inspect.State()
 	writeJSON(w, http.StatusOK, hdc.FiberDistribution(state))
+}
+
+func (s *Server) handleGetHDCCrosswalk(w http.ResponseWriter, r *http.Request) {
+	from := strings.TrimSpace(r.URL.Query().Get("from"))
+	to := strings.TrimSpace(r.URL.Query().Get("to"))
+	if from == "" || to == "" {
+		writeError(w, http.StatusBadRequest, "missing from/to query parameters")
+		return
+	}
+
+	state := s.inspect.State()
+	res, ok := hdc.ComputeCrosswalk(state, from, to, nil)
+	if !ok {
+		writeError(w, http.StatusNotFound, "scheme not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleGetHDCCrosswalkComposition(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	rows := hdc.CrosswalkCompositionChecks(state, nil)
+
+	top := -1
+	if raw := strings.TrimSpace(r.URL.Query().Get("top")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid top")
+			return
+		}
+		top = parsed
+	}
+	if top > 0 && top < len(rows) {
+		rows = rows[:top]
+	}
+
+	writeJSON(w, http.StatusOK, rows)
+}
+
+func (s *Server) handleGetHDCCrosswalkSuggestions(w http.ResponseWriter, r *http.Request) {
+	threshold := 0.7
+	if raw := strings.TrimSpace(r.URL.Query().Get("threshold")); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid threshold")
+			return
+		}
+		threshold = parsed
+	}
+
+	state := s.inspect.State()
+	writeJSON(w, http.StatusOK, hdc.CrosswalkSuggestions(state, nil, threshold))
+}
+
+func (s *Server) handleGetHDCClassificationSpace(w http.ResponseWriter, r *http.Request) {
+	state := s.inspect.State()
+	writeJSON(w, http.StatusOK, hdc.ClassificationSpace(state, nil))
 }
 
 // --- Helpers ---

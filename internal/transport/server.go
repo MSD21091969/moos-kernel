@@ -36,6 +36,20 @@ func NewServer(rt *kernel.Runtime, registry *operad.Registry, _ int) *Server {
 	return &Server{rt: rt, inspect: rt, write: rt, observe: rt, registry: registry}
 }
 
+// corsMiddleware adds CORS headers to every response and handles OPTIONS preflight.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -71,7 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /hdc/crosswalk/suggestions", s.handleGetHDCCrosswalkSuggestions)
 	mux.HandleFunc("GET /hdc/classification-space", s.handleGetHDCClassificationSpace)
 
-	return mux
+	return corsMiddleware(mux)
 }
 
 // --- Health ---

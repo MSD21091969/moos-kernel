@@ -42,7 +42,7 @@ Relations are truth. Properties never duplicate topology.
 ## Package Structure
 
 ```
-internal/graph      — pure types (no IO): Node, Relation, Property, Rewrite,
+internal/graph      — pure types (no IO): Node, Relation, Property, Rewrite, Envelope,
                       GraphState, URN, Stratum, RewriteCategory
 internal/fold       — pure catamorphism: Evaluate, Replay, EvaluateProgram
 internal/operad     — type system: Registry (WF01–WF19), ValidateLINK,
@@ -90,9 +90,9 @@ go run ./cmd/moos \
 go test ./internal/...
 ```
 
-Test files: `fold/fold_test.go`, `hdc/hdc_test.go`, `hdc/spectral_test.go`,
-`hdc/fiber_test.go`, `hdc/crosswalk_test.go`, `kernel/runtime_reactive_test.go`,
-`reactive/engine_test.go`. No external test dependencies — stdlib only.
+Test files: `internal/fold/fold_test.go`, `internal/hdc/hdc_test.go`, `internal/hdc/spectral_test.go`,
+`internal/hdc/fiber_test.go`, `internal/hdc/crosswalk_test.go`, `internal/kernel/runtime_reactive_test.go`,
+`internal/reactive/engine_test.go`. No external test dependencies — stdlib only.
 
 ---
 

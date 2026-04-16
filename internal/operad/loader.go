@@ -8,7 +8,7 @@ import (
 	"moos/kernel/internal/graph"
 )
 
-// LoadRegistry parses ontology.json (v3.1, codex-aligned format) and
+// LoadRegistry parses ontology.json (v3.6, codex-aligned format) and
 // builds a Registry. The ontology path should point to
 // ffs0/kb/superset/ontology.json or a copy of it.
 //
@@ -44,7 +44,7 @@ func LoadRegistry(path string) (*Registry, error) {
 		reg.NodeTypes[graph.TypeID(nt.ID)] = parseNodeTypeSpec(nt)
 	}
 
-	// Load rewrite categories (WF01-WF15)
+	// Load rewrite categories (WF01-WF19)
 	for _, wf := range raw.RewriteCategories {
 		spec := RewriteCategorySpec{
 			ID:       graph.RewriteCategory(wf.ID),
@@ -139,7 +139,7 @@ func parseColorMatrix(raw map[string]map[string]any) PortColorMatrix {
 	return m
 }
 
-// --- raw JSON shapes for ontology.json v3.1 ---
+// --- raw JSON shapes for ontology.json v3.6 ---
 
 type ontologyJSON struct {
 	Types struct {

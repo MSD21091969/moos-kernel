@@ -178,6 +178,11 @@ func (e *Engine) evaluateGuard(guard graph.Node) bool {
 				result = fmt.Sprintf("%v", p.Value) == expected
 			}
 		}
+	case "field_set":
+		// M8 completeness predicate: field must be present on the target node (any value).
+		if n, ok := e.State.Nodes[targetURN]; ok {
+			_, result = n.Properties[field]
+		}
 	case "relation_exists":
 		for _, rel := range e.State.Relations {
 			if rel.SrcURN == targetURN || rel.TgtURN == targetURN {
@@ -195,6 +200,14 @@ func (e *Engine) evaluateGuard(guard graph.Node) bool {
 		return !result
 	}
 	return result
+}
+
+// EvaluatePredicate is the public form of evaluateGuard.
+// Used by the kernel's gate-check path (M8) to evaluate gate nodes on the apply pathway.
+// gate nodes use identical predicate structure to guard nodes but live on the apply path,
+// not the reactive path — they fail-close rewrites rather than gating reactor proposals.
+func (e *Engine) EvaluatePredicate(node graph.Node) bool {
+	return e.evaluateGuard(node)
 }
 
 // react finds all reactors linked from the watcher via "triggers" port

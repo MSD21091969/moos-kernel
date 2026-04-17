@@ -101,6 +101,11 @@ func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
 		}
 	}
 
+	// Gate check (M8): fail-closed if any gate node guards the affected node and its predicate fails.
+	if err := rt.checkGatesLocked(env); err != nil {
+		return graph.EvalResult{}, err
+	}
+
 	next, result, err := fold.Evaluate(rt.state, env)
 	if err != nil {
 		return graph.EvalResult{}, err
@@ -156,12 +161,15 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 	}
 	envelopes = injected
 
-	// Strata enforcement (M5) for each LINK in the batch.
+	// Strata enforcement (M5) + Gate checks (M8) for each envelope in the batch.
 	for _, env := range envelopes {
 		if env.RewriteType == graph.LINK && rt.registry != nil {
 			if err := rt.registry.ValidateStrataLink(env, rt.state); err != nil {
 				return nil, err
 			}
+		}
+		if err := rt.checkGatesLocked(env); err != nil {
+			return nil, err
 		}
 	}
 
@@ -393,6 +401,55 @@ func (rt *Runtime) applyReactiveLocked(env graph.Envelope) {
 	rt.state = next
 	rt.log = append(rt.log, persisted)
 	rt.broadcast(persisted)
+}
+
+// checkGatesLocked evaluates all gate nodes linked to the rewrite's target node via
+// "guards"/"guarded-by" relations. Returns an error if any gate predicate fails.
+// Gate nodes live on the APPLY pathway (M8) — they block rewrites, distinct from
+// guard nodes which live on the REACTIVE pathway and gate reactor proposals.
+// Called with rt.mu already held.
+func (rt *Runtime) checkGatesLocked(env graph.Envelope) error {
+	// Determine the primary node URN affected by this rewrite.
+	var targetURN graph.URN
+	switch env.RewriteType {
+	case graph.ADD:
+		return nil // ADD creates a new node — no existing gates can be set on it yet
+	case graph.MUTATE:
+		targetURN = env.TargetURN
+	case graph.LINK:
+		targetURN = env.SrcURN
+	case graph.UNLINK:
+		if rel, ok := rt.state.Relations[env.RelationURN]; ok {
+			targetURN = rel.SrcURN
+		}
+	}
+	if targetURN == "" {
+		return nil
+	}
+
+	eng := reactive.Engine{State: &rt.state}
+	for _, rel := range rt.state.Relations {
+		// gate --guards--> targetNode (same port pair as guard→watcher in WF17)
+		if rel.TgtURN != targetURN || rel.TgtPort != "guarded-by" {
+			continue
+		}
+		gateNode, ok := rt.state.Nodes[rel.SrcURN]
+		if !ok {
+			return fmt.Errorf("gate(M8): node %s referenced but not found — rewrite blocked (fail-closed)", rel.SrcURN)
+		}
+		if gateNode.TypeID != "gate" {
+			continue // guard nodes (WF17 reactive) are ignored here
+		}
+		if !eng.EvaluatePredicate(gateNode) {
+			predType := ""
+			if p, ok := gateNode.Properties["predicate_type"]; ok {
+				predType, _ = p.Value.(string)
+			}
+			return fmt.Errorf("gate(M8): gate %s predicate %q failed for %s — rewrite blocked",
+				rel.SrcURN, predType, targetURN)
+		}
+	}
+	return nil
 }
 
 // bumpSessionLocalT increments the local_t property on a session node after each

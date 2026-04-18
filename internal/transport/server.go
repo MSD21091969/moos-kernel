@@ -119,8 +119,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /twin/ingest", s.handleTwinIngest)
 	mux.HandleFunc("GET /twin/status", s.handleTwinStatus)
 
-	// T-hook introspection (§M14 — predicate evaluator endpoint)
+	// T-hook introspection (§M14 — predicate evaluator endpoints)
 	mux.HandleFunc("GET /t-hook/evaluate/{urn}", s.handleGetTHookEvaluate)
+	mux.HandleFunc("POST /t-hook/evaluate", s.handleBatchTHookEvaluate)
 
 	return s.corsMiddleware(mux)
 }

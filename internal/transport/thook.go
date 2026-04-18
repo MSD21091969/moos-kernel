@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -97,6 +98,106 @@ func (s *Server) handleGetTHookEvaluate(w http.ResponseWriter, r *http.Request) 
 	}
 	if reactProp, ok := node.Properties["react_template"]; ok {
 		resp["react_template"] = reactProp.Value
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// batchEvaluateRequest is the JSON body shape accepted by
+// handleBatchTHookEvaluate.
+//
+// `At` is a pointer so we can distinguish an omitted value from an explicit 0;
+// an omitted `at` falls back to currentTDay().
+type batchEvaluateRequest struct {
+	URNs []string `json:"urns"`
+	At   *int     `json:"at,omitempty"`
+}
+
+// handleBatchTHookEvaluate evaluates many t_hook predicates in one call.
+//
+// Route: POST /t-hook/evaluate
+//
+// Body:
+//
+//	{
+//	  "urns": ["urn:moos:t_hook:...", "urn:moos:t_hook:...", ...],
+//	  "at":   220                              // optional; defaults to currentTDay()
+//	}
+//
+// Response (200 OK): an array preserving request order. Each entry is either
+// a success record (same shape as GET /t-hook/evaluate/{urn}) or an error
+// record with an `error` field. One bad URN in the batch does not fail the
+// whole request — callers render per-entry.
+//
+// Success entry:
+//
+//	{"urn": "...", "at_t": 220, "fires": true, "predicate": {...}, "owner_urn": "...", "react_template": {...}}
+//
+// Error entry:
+//
+//	{"urn": "...", "at_t": 220, "error": "t_hook not found: ..."}
+//
+// Status codes:
+//
+//	200 — any well-formed request body (per-entry errors inline)
+//	400 — malformed JSON body OR empty body
+//
+// The batch variant saves O(N) round-trips when the t-cone renderer or an
+// operator dashboard needs to evaluate many hooks at once. State is fetched
+// exactly once, so the handler's big-O is the predicate evaluator cost
+// summed across the batch plus a single state snapshot.
+func (s *Server) handleBatchTHookEvaluate(w http.ResponseWriter, r *http.Request) {
+	var req batchEvaluateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	atT := currentTDay()
+	if req.At != nil {
+		atT = *req.At
+	}
+
+	// Fetch state once — amortises the potential clone/lock cost across the
+	// entire batch. Predicates that reference other nodes (after_urn /
+	// before_urn) read from this same snapshot, giving batch-wide coherence.
+	state := s.inspect.State()
+
+	resp := make([]map[string]any, 0, len(req.URNs))
+	for _, urnStr := range req.URNs {
+		entry := map[string]any{
+			"urn":  urnStr,
+			"at_t": atT,
+		}
+		urn := graph.URN(urnStr)
+
+		node, ok := state.Nodes[urn]
+		if !ok {
+			entry["error"] = fmt.Sprintf("t_hook not found: %s", urnStr)
+			resp = append(resp, entry)
+			continue
+		}
+		if node.TypeID != "t_hook" {
+			entry["error"] = fmt.Sprintf("node is not a t_hook (type=%s)", node.TypeID)
+			resp = append(resp, entry)
+			continue
+		}
+		predProp, hasPred := node.Properties["predicate"]
+		if !hasPred || predProp.Value == nil {
+			entry["error"] = "t_hook has no predicate value — nothing to evaluate"
+			resp = append(resp, entry)
+			continue
+		}
+
+		entry["fires"] = reactive.EvaluateThookPredicate(predProp.Value, &state, atT)
+		entry["predicate"] = predProp.Value
+		if ownerProp, ok := node.Properties["owner_urn"]; ok {
+			entry["owner_urn"] = ownerProp.Value
+		}
+		if reactProp, ok := node.Properties["react_template"]; ok {
+			entry["react_template"] = reactProp.Value
+		}
+		resp = append(resp, entry)
 	}
 
 	writeJSON(w, http.StatusOK, resp)

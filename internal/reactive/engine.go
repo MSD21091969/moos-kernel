@@ -12,14 +12,16 @@ import (
 	"moos/kernel/internal/graph"
 )
 
-// Engine evaluates watcher/reactor/guard nodes against incoming rewrites.
+// Engine evaluates watcher/reactor/guard nodes against incoming rewrites,
+// as well as t_hook nodes owned by the affected node (M6 first-class t-hooks).
 // It is read-only over graph state — it never mutates the graph directly.
 type Engine struct {
 	State *graph.GraphState
 }
 
-// Evaluate takes a just-applied rewrite and returns proposed rewrites
-// from any matching watcher→reactor chains whose guards all pass.
+// Evaluate takes a just-applied rewrite and returns proposed rewrites from:
+//  1. Watcher→Reactor chains (existing WF17 pattern) whose guards all pass.
+//  2. T-hook nodes (M6) owned by the affected node whose event_shape + guard_ref pass.
 func (e *Engine) Evaluate(rewrite graph.PersistedRewrite) []graph.Envelope {
 	var proposals []graph.Envelope
 
@@ -28,7 +30,7 @@ func (e *Engine) Evaluate(rewrite graph.PersistedRewrite) []graph.Envelope {
 	// Determine the affected node URN and type_id from the envelope.
 	affectedURN, affectedTypeID := e.affected(env)
 
-	// Scan all nodes for active watchers.
+	// Pass 1: Watcher/Guard/Reactor chain (WF17 pattern — unchanged).
 	for _, node := range e.State.Nodes {
 		if node.TypeID != "watcher" {
 			continue
@@ -41,6 +43,34 @@ func (e *Engine) Evaluate(rewrite graph.PersistedRewrite) []graph.Envelope {
 		}
 		proposed := e.react(node.URN, affectedURN, affectedTypeID, env.Actor)
 		proposals = append(proposals, proposed...)
+	}
+
+	// Pass 2: T-hooks owned by the affected node (M6 first-class hooks).
+	// A t_hook fires when its owner_urn == affectedURN, event_shape matches,
+	// and the optional guard_ref predicate passes. No WF LINK required.
+	if affectedURN != "" {
+		for _, thook := range e.State.Nodes {
+			if thook.TypeID != "t_hook" {
+				continue
+			}
+			if propStr(thook, "status") != "active" {
+				continue
+			}
+			if propStr(thook, "owner_urn") != string(affectedURN) {
+				continue
+			}
+			if !e.thookEventShapeMatches(thook, env, affectedTypeID) {
+				continue
+			}
+			if !e.thookGuardPasses(thook) {
+				continue
+			}
+			proposal, err := e.buildFromProp(thook, "react_template", affectedURN, affectedTypeID, env.Actor)
+			if err != nil {
+				continue
+			}
+			proposals = append(proposals, proposal)
+		}
 	}
 
 	return proposals
@@ -148,6 +178,11 @@ func (e *Engine) evaluateGuard(guard graph.Node) bool {
 				result = fmt.Sprintf("%v", p.Value) == expected
 			}
 		}
+	case "field_set":
+		// M8 completeness predicate: field must be present on the target node (any value).
+		if n, ok := e.State.Nodes[targetURN]; ok {
+			_, result = n.Properties[field]
+		}
 	case "relation_exists":
 		for _, rel := range e.State.Relations {
 			if rel.SrcURN == targetURN || rel.TgtURN == targetURN {
@@ -165,6 +200,14 @@ func (e *Engine) evaluateGuard(guard graph.Node) bool {
 		return !result
 	}
 	return result
+}
+
+// EvaluatePredicate is the public form of evaluateGuard.
+// Used by the kernel's gate-check path (M8) to evaluate gate nodes on the apply pathway.
+// gate nodes use identical predicate structure to guard nodes but live on the apply path,
+// not the reactive path — they fail-close rewrites rather than gating reactor proposals.
+func (e *Engine) EvaluatePredicate(node graph.Node) bool {
+	return e.evaluateGuard(node)
 }
 
 // react finds all reactors linked from the watcher via "triggers" port
@@ -198,18 +241,25 @@ func (e *Engine) react(watcherURN, matchedURN graph.URN, matchedTypeID graph.Typ
 	return proposals
 }
 
-// buildFromTemplate parses the reactor's template property as a JSON envelope,
-// substituting $matched_urn, $matched_type_id, and $actor placeholders.
+// buildFromTemplate parses the reactor's "template" property as a JSON envelope.
+// Delegates to buildFromProp.
 func (e *Engine) buildFromTemplate(reactor graph.Node, matchedURN graph.URN, matchedTypeID graph.TypeID, actor graph.URN) (graph.Envelope, error) {
-	tmplProp, ok := reactor.Properties["template"]
+	return e.buildFromProp(reactor, "template", matchedURN, matchedTypeID, actor)
+}
+
+// buildFromProp parses a named property on a node as a JSON envelope template,
+// substituting $matched_urn, $matched_type_id, and $actor placeholders.
+// Used by both reactor nodes ("template") and t_hook nodes ("react_template").
+func (e *Engine) buildFromProp(node graph.Node, propName string, matchedURN graph.URN, matchedTypeID graph.TypeID, actor graph.URN) (graph.Envelope, error) {
+	tmplProp, ok := node.Properties[propName]
 	if !ok {
-		return graph.Envelope{}, fmt.Errorf("reactor %s: no template property", reactor.URN)
+		return graph.Envelope{}, fmt.Errorf("%s %s: no %q property", node.TypeID, node.URN, propName)
 	}
 
 	// The template is stored as a JSON object (map or raw JSON).
 	raw, err := json.Marshal(tmplProp.Value)
 	if err != nil {
-		return graph.Envelope{}, fmt.Errorf("reactor %s: marshal template: %w", reactor.URN, err)
+		return graph.Envelope{}, fmt.Errorf("%s %s: marshal %q: %w", node.TypeID, node.URN, propName, err)
 	}
 
 	// Substitute placeholders in the raw JSON string.
@@ -220,10 +270,87 @@ func (e *Engine) buildFromTemplate(reactor graph.Node, matchedURN graph.URN, mat
 
 	var env graph.Envelope
 	if err := json.Unmarshal([]byte(s), &env); err != nil {
-		return graph.Envelope{}, fmt.Errorf("reactor %s: unmarshal template: %w", reactor.URN, err)
+		return graph.Envelope{}, fmt.Errorf("%s %s: unmarshal %q: %w", node.TypeID, node.URN, propName, err)
 	}
 
 	return env, nil
+}
+
+// thookEventShape is the JSON structure stored in a t_hook's event_shape property.
+// All fields are optional — omit or set to "" / "*" to match any value.
+type thookEventShape struct {
+	RewriteType string `json:"rewrite_type"` // "" or "*" = any
+	TypeID      string `json:"type_id"`      // "" or "*" = any
+	URNPrefix   string `json:"urn_prefix"`   // "" = any; matched against owner_urn
+	Port        string `json:"port"`         // "" = any (for LINK/UNLINK src_port or tgt_port)
+	Field       string `json:"field"`        // "" or "*" = any (for MUTATE)
+}
+
+// thookEventShapeMatches checks whether a t_hook's event_shape filter passes
+// for the given rewrite. Missing event_shape means "match all" (open hook).
+//
+// TODO(perf): this function is called once per t_hook per rewrite, and the
+// JSON marshal+unmarshal round-trip on event_shape is pure overhead when the
+// stored value is already map[string]any (the common case after log replay).
+// Fast-path: type-switch on prop.Value.(map[string]any) and read fields
+// directly without re-encoding. Stored value cached on the node at ADD time
+// would be even better, but requires extending the graph types (PR #8
+// review, Gemini).
+func (e *Engine) thookEventShapeMatches(thook graph.Node, env graph.Envelope, affectedTypeID graph.TypeID) bool {
+	prop, ok := thook.Properties["event_shape"]
+	if !ok {
+		return true // no filter — fire on every rewrite that affects the owner
+	}
+	raw, err := json.Marshal(prop.Value)
+	if err != nil {
+		return false
+	}
+	var shape thookEventShape
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return false
+	}
+	if shape.RewriteType != "" && shape.RewriteType != "*" {
+		if string(env.RewriteType) != shape.RewriteType {
+			return false
+		}
+	}
+	if shape.TypeID != "" && shape.TypeID != "*" {
+		if string(affectedTypeID) != shape.TypeID {
+			return false
+		}
+	}
+	if shape.URNPrefix != "" {
+		ownerURN := propStr(thook, "owner_urn")
+		if !strings.HasPrefix(ownerURN, shape.URNPrefix) {
+			return false
+		}
+	}
+	if shape.Port != "" {
+		if env.SrcPort != shape.Port && env.TgtPort != shape.Port {
+			return false
+		}
+	}
+	if shape.Field != "" && shape.Field != "*" {
+		if env.Field != shape.Field {
+			return false
+		}
+	}
+	return true
+}
+
+// thookGuardPasses evaluates the t_hook's optional guard_ref predicate.
+// Returns true if guard_ref is empty (no guard required).
+// Fail-closed: returns false if the guard node is referenced but not found.
+func (e *Engine) thookGuardPasses(thook graph.Node) bool {
+	guardRef := propStr(thook, "guard_ref")
+	if guardRef == "" {
+		return true
+	}
+	guardNode, ok := e.State.Nodes[graph.URN(guardRef)]
+	if !ok {
+		return false // guard missing — fail closed (M8 semantics)
+	}
+	return e.evaluateGuard(guardNode)
 }
 
 // propStr reads a string property value from a node, returning "" if missing.

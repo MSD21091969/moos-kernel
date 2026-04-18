@@ -174,7 +174,7 @@ func portColorFromName(port string) graph.PortColor {
 		return "" // ambiguous: compute or storage depending on src node type — skip color check
 	case "participates", "participated-by", "focus", "on",
 		"anchors", "anchor", "causes", "summarizes", "daily-summary", "depends-on", "depended-by", "participant",
-		"triggers", "triggered-by", "guards", "guarded-by", "emits", "emitted-by", "watches":
+		"triggers", "triggered-by", "guards", "guarded-by", "emits", "emitted-by", "watches", "watched-by":
 		return graph.ColorWorkflow
 	case "projected-to", "rendered-as", "displayed-as":
 		return graph.ColorProjection
@@ -218,6 +218,67 @@ func containsRewrite(list []graph.RewriteType, rt graph.RewriteType) bool {
 func containsString(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateStrataLink enforces M5 strata filtration for LINK rewrites.
+// Called with the kernel read-lock held (state is consistent).
+//
+// Rules:
+//  1. S4 (Projected) nodes may not be the src of a LINK to S0/S1/S2 nodes.
+//     Projection nodes are read-only toward lower strata (M5).
+//  2. If the WF category declares non-empty src_types or tgt_types, the actual
+//     node types must be in those lists. (Previously stubbed — now enforced.)
+func (r *Registry) ValidateStrataLink(env graph.Envelope, state graph.GraphState) error {
+	srcNode, srcOk := state.Nodes[env.SrcURN]
+	tgtNode, tgtOk := state.Nodes[env.TgtURN]
+	if !srcOk || !tgtOk {
+		return nil // nodes not found — fold.applyLINK will return ErrNodeNotFound
+	}
+
+	srcSpec, hasSrc := r.NodeTypes[srcNode.TypeID]
+	tgtSpec, hasTgt := r.NodeTypes[tgtNode.TypeID]
+	if !hasSrc || !hasTgt {
+		return nil // unknown type — already rejected by ValidateADD at creation time
+	}
+
+	srcStratum, err := graph.ParseStratum(srcSpec.Stratum)
+	if err != nil {
+		return nil // unknown stratum — be permissive; operad coverage issue, not a violation
+	}
+	tgtStratum, err := graph.ParseStratum(tgtSpec.Stratum)
+	if err != nil {
+		return nil
+	}
+
+	// Rule 1: S4 → S0/S1/S2 LINK is forbidden (M5 filtration direction).
+	if srcStratum == graph.S4 && tgtStratum < graph.S3 {
+		return fmt.Errorf("strata(M5): S4 node %s (%s) may not LINK to %s node %s (%s); projection nodes are read-only toward lower strata",
+			env.SrcURN, srcNode.TypeID, tgtSpec.Stratum, env.TgtURN, tgtNode.TypeID)
+	}
+
+	// Rule 2: WF src_types / tgt_types enforcement.
+	wfSpec, ok := r.RewriteCategories[env.RewriteCategory]
+	if !ok {
+		return nil // unknown WF — already caught by ValidateLINK
+	}
+	if len(wfSpec.SrcTypes) > 0 && !containsTypeID(wfSpec.SrcTypes, srcNode.TypeID) {
+		return fmt.Errorf("operad: src type %q not in allowed list for %s: %v",
+			srcNode.TypeID, env.RewriteCategory, wfSpec.SrcTypes)
+	}
+	if len(wfSpec.TgtTypes) > 0 && !containsTypeID(wfSpec.TgtTypes, tgtNode.TypeID) {
+		return fmt.Errorf("operad: tgt type %q not in allowed list for %s: %v",
+			tgtNode.TypeID, env.RewriteCategory, wfSpec.TgtTypes)
+	}
+	return nil
+}
+
+func containsTypeID(list []graph.TypeID, id graph.TypeID) bool {
+	for _, v := range list {
+		if v == id {
 			return true
 		}
 	}

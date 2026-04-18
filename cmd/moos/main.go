@@ -35,6 +35,9 @@ func main() {
 	doSeed := flag.Bool("seed", false, "seed infrastructure nodes from flags")
 	seedUser := flag.String("seed-user", "sam", "username for seed node")
 	seedWS := flag.String("seed-ws", "hp-laptop", "workstation name for seed node")
+	quicAddr := flag.String("quic-addr", "", "UDP address for HTTP/3 QUIC listener (e.g. :4433). Requires --tls-cert and --tls-key.")
+	tlsCert  := flag.String("tls-cert", "", "Path to TLS certificate file (PEM) for QUIC listener")
+	tlsKey   := flag.String("tls-key",  "", "Path to TLS private key file (PEM) for QUIC listener")
 	flag.Parse()
 
 	// --- Load registry ---
@@ -90,9 +93,10 @@ func main() {
 	}
 
 	// --- Start HTTP transport ---
+	tSrv := transport.NewServer(rt, registry, tDay())
 	httpSrv := &http.Server{
 		Addr:    *listenAddr,
-		Handler: transport.NewServer(rt, registry, tDay()).Handler(),
+		Handler: tSrv.Handler(),
 	}
 	go func() {
 		log.Printf("transport: listening on %s", *listenAddr)
@@ -100,6 +104,8 @@ func main() {
 			log.Printf("transport: %v", err)
 		}
 	}()
+	// M9: start twin sync goroutine (forwards rewrites to eager twin_link endpoints).
+	go tSrv.RunTwinSync()
 
 	// --- Start MCP server ---
 	mcpSrv := mcp.NewServer(rt)
@@ -120,6 +126,23 @@ func main() {
 			log.Println("mcp: starting stdio transport")
 			mcpSrv.HandleStdio(ctx, os.Stdin, os.Stdout)
 		}()
+	}
+
+	// --- Start HTTP/3 QUIC transport (M10) ---
+	if *quicAddr != "" {
+		// Fail fast with a clear message rather than letting ServeQUIC emit a
+		// generic "open tls-cert: no such file" deep in the goroutine where
+		// it's easy to miss. Addresses PR #8 review (Copilot).
+		if *tlsCert == "" || *tlsKey == "" {
+			log.Fatalf("--quic-addr=%s requires both --tls-cert and --tls-key to be set (got cert=%q key=%q)",
+				*quicAddr, *tlsCert, *tlsKey)
+		}
+		// Advertise HTTP/3 via Alt-Svc, using the actual configured QUIC
+		// UDP port, not a hardcoded :443. Clients need the correct
+		// port/authority for HTTP/3 discovery; hardcoded :443 was a bug
+		// when running on non-default ports (PR #8 review, Copilot+Gemini).
+		tSrv.SetAltSvc(fmt.Sprintf(`h3=%q; ma=2592000`, *quicAddr))
+		go tSrv.ServeQUIC(*quicAddr, *tlsCert, *tlsKey)
 	}
 
 	// --- Graceful shutdown ---

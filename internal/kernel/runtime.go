@@ -94,6 +94,18 @@ func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
 		}
 	}
 
+	// Strata enforcement (M5): validate LINK direction against filtration rules.
+	if env.RewriteType == graph.LINK && rt.registry != nil {
+		if err := rt.registry.ValidateStrataLink(env, rt.state); err != nil {
+			return graph.EvalResult{}, err
+		}
+	}
+
+	// Gate check (M8): fail-closed if any gate node guards the affected node and its predicate fails.
+	if err := rt.checkGatesLocked(env); err != nil {
+		return graph.EvalResult{}, err
+	}
+
 	next, result, err := fold.Evaluate(rt.state, env)
 	if err != nil {
 		return graph.EvalResult{}, err
@@ -113,6 +125,10 @@ func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
 
 	rt.state = next
 	rt.log = append(rt.log, persisted)
+	// M1: increment session local_t if actor is a session node.
+	if actorNode, ok := rt.state.Nodes[env.Actor]; ok && actorNode.TypeID == "session" {
+		rt.bumpSessionLocalT(env.Actor)
+	}
 	rt.broadcast(persisted)
 	rt.runReactive(persisted)
 	rt.runHDCIndexAndDriftLocked(env)
@@ -132,16 +148,46 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
-	// Inject PropertySpec for additive MUTATEs against the current state.
-	// We walk the envelopes; the state evolves as we go (best-effort — use current state).
+	// Walk the batch, maintaining a working state as we go. Each envelope's
+	// PropertySpec injection, strata enforcement, and gate check runs against
+	// the state AS IT WOULD BE after the prior envelopes in this batch have
+	// been applied. This lets valid sequential patterns land (e.g. ADD an
+	// approval node, then MUTATE the gated node in the same program) where
+	// the old pre-batch-only validation incorrectly rejected them (PR #8
+	// review, Copilot).
+	//
+	// TODO(perf): the gate check inside this loop is O(envelopes × R) where
+	// R is the relation count. For large batches on large graphs, maintain
+	// an index of guarded nodes so we can skip the inner scan when no gates
+	// touch the target set (PR #8 review, Gemini).
 	injected := make([]graph.Envelope, len(envelopes))
+	workingState := rt.state.Clone()
 	for i, env := range envelopes {
 		if env.RewriteType == graph.MUTATE && rt.registry != nil {
-			if node, ok := rt.state.Nodes[env.TargetURN]; ok {
+			if node, ok := workingState.Nodes[env.TargetURN]; ok {
 				env = rt.injectPropertySpec(env, node)
 			}
 		}
 		injected[i] = env
+
+		// Strata enforcement (M5) + Gate check (M8) against the working state.
+		if env.RewriteType == graph.LINK && rt.registry != nil {
+			if err := rt.registry.ValidateStrataLink(env, workingState); err != nil {
+				return nil, err
+			}
+		}
+		if err := rt.checkGatesAgainstState(env, &workingState); err != nil {
+			return nil, err
+		}
+
+		// Advance the working state by applying this envelope before
+		// validating the next one. On failure bail early — ApplyProgram
+		// is all-or-nothing so a later error still rolls back cleanly.
+		next, _, err := fold.Evaluate(workingState, env)
+		if err != nil {
+			return nil, err
+		}
+		workingState = next
 	}
 	envelopes = injected
 
@@ -169,6 +215,18 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 
 	rt.state = nextState
 	rt.log = append(rt.log, persisted...)
+	// M1: bump local_t for all unique session actors in the batch.
+	{
+		seen := make(map[graph.URN]bool)
+		for _, env := range envelopes {
+			if !seen[env.Actor] {
+				seen[env.Actor] = true
+				if actorNode, ok := rt.state.Nodes[env.Actor]; ok && actorNode.TypeID == "session" {
+					rt.bumpSessionLocalT(env.Actor)
+				}
+			}
+		}
+	}
 	for _, p := range persisted {
 		rt.broadcast(p)
 	}
@@ -363,6 +421,151 @@ func (rt *Runtime) applyReactiveLocked(env graph.Envelope) {
 	rt.broadcast(persisted)
 }
 
+// checkGatesLocked evaluates all gate nodes linked to the rewrite's affected
+// nodes via "guards"/"guarded-by" relations. Returns an error if any gate
+// predicate fails. Gate nodes live on the APPLY pathway (M8) — they block
+// rewrites, distinct from guard nodes which live on the REACTIVE pathway
+// and gate reactor proposals. Called with rt.mu already held.
+//
+// For LINK and UNLINK we check gates on BOTH endpoints (src and tgt), so a
+// gate on either side blocks the operation. Previously only the src side
+// was checked, which allowed a bypass where a gated node could still be
+// linked/unlinked as the target (PR #8 review, Copilot).
+//
+// TODO(perf): this is an O(R) scan of all relations per rewrite. For large
+// graphs with many gate relations, maintain a map[URN]struct{} index of
+// nodes with at least one "guarded-by" inbound relation, updated during
+// LINK/UNLINK (PR #8 review, Gemini + Copilot).
+func (rt *Runtime) checkGatesLocked(env graph.Envelope) error {
+	return rt.checkGatesAgainstState(env, &rt.state)
+}
+
+// checkGatesAgainstState is the state-parameterised form of checkGatesLocked.
+// Exported-to-package so ApplyProgram can evaluate gates against an evolving
+// working state (one envelope at a time) rather than the pre-batch state —
+// prevents the earlier-ADD-then-later-gated-MUTATE valid pattern from being
+// incorrectly rejected (PR #8 review, Copilot).
+func (rt *Runtime) checkGatesAgainstState(env graph.Envelope, state *graph.GraphState) error {
+	// Collect all node URNs affected by this rewrite. For LINK/UNLINK we
+	// check gates on BOTH endpoints — a gate on either side blocks the op.
+	var targets []graph.URN
+	switch env.RewriteType {
+	case graph.ADD:
+		return nil // ADD creates a new node — no existing gates can guard it yet
+	case graph.MUTATE:
+		if env.TargetURN != "" {
+			targets = append(targets, env.TargetURN)
+		}
+	case graph.LINK:
+		if env.SrcURN != "" {
+			targets = append(targets, env.SrcURN)
+		}
+		if env.TgtURN != "" && env.TgtURN != env.SrcURN {
+			targets = append(targets, env.TgtURN)
+		}
+	case graph.UNLINK:
+		if rel, ok := state.Relations[env.RelationURN]; ok {
+			if rel.SrcURN != "" {
+				targets = append(targets, rel.SrcURN)
+			}
+			if rel.TgtURN != "" && rel.TgtURN != rel.SrcURN {
+				targets = append(targets, rel.TgtURN)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	// Build a set for O(1) membership check inside the relations loop.
+	targetSet := make(map[graph.URN]struct{}, len(targets))
+	for _, u := range targets {
+		targetSet[u] = struct{}{}
+	}
+
+	eng := reactive.Engine{State: state}
+	for _, rel := range state.Relations {
+		// gate --guards--> targetNode (same port pair as guard→watcher in WF17)
+		if rel.TgtPort != "guarded-by" {
+			continue
+		}
+		if _, guarded := targetSet[rel.TgtURN]; !guarded {
+			continue
+		}
+		gateNode, ok := state.Nodes[rel.SrcURN]
+		if !ok {
+			return fmt.Errorf("gate(M8): node %s referenced but not found — rewrite blocked (fail-closed)", rel.SrcURN)
+		}
+		if gateNode.TypeID != "gate" {
+			continue // guard nodes (WF17 reactive) are ignored here
+		}
+		if !eng.EvaluatePredicate(gateNode) {
+			predType := ""
+			if p, ok := gateNode.Properties["predicate_type"]; ok {
+				predType, _ = p.Value.(string)
+			}
+			return fmt.Errorf("gate(M8): gate %s predicate %q failed for %s — rewrite blocked",
+				rel.SrcURN, predType, rel.TgtURN)
+		}
+	}
+	return nil
+}
+
+// bumpSessionLocalT increments the local_t property on a session node after each
+// kernel-acknowledged rewrite issued by that session (M1).
+// Called with rt.mu already held.
+// The increment is a kernel-internal MUTATE — it is persisted to the log and broadcast.
+func (rt *Runtime) bumpSessionLocalT(sessionURN graph.URN) {
+	actorNode, ok := rt.state.Nodes[sessionURN]
+	if !ok || actorNode.TypeID != "session" {
+		return
+	}
+
+	var currentT int64
+	if prop, ok := actorNode.Properties["local_t"]; ok {
+		switch v := prop.Value.(type) {
+		case float64:
+			currentT = int64(v)
+		case int64:
+			currentT = v
+		case int:
+			currentT = int64(v)
+		}
+	}
+
+	kernelActor := rt.hdcActorURN(sessionURN)
+	mutEnv := graph.Envelope{
+		RewriteType:     graph.MUTATE,
+		Actor:           kernelActor,
+		RewriteCategory: graph.WF19,
+		TargetURN:       sessionURN,
+		Field:           "local_t",
+		NewValue:        currentT + 1,
+	}
+	// Inject PropertySpec for additive MUTATE (local_t may not be on node yet).
+	mutEnv = rt.injectPropertySpec(mutEnv, actorNode)
+
+	next, _, err := fold.Evaluate(rt.state, mutEnv)
+	if err != nil {
+		return // local_t not declared in ontology or other structural issue — skip
+	}
+
+	seq := rt.logSeq.Add(1)
+	now := time.Now().UTC()
+	persisted := graph.PersistedRewrite{
+		Envelope:  mutEnv,
+		AppliedAt: now,
+		Timestamp: now,
+		LogSeq:    seq,
+	}
+	if err := rt.store.Append([]graph.PersistedRewrite{persisted}); err != nil {
+		return
+	}
+	rt.state = next
+	rt.log = append(rt.log, persisted)
+	rt.broadcast(persisted)
+}
+
 // runHDCIndexAndDriftLocked updates the in-memory HDC index and emits type-drift claims.
 // Called with rt.mu already held.
 func (rt *Runtime) runHDCIndexAndDriftLocked(trigger graph.Envelope) {
@@ -523,9 +726,16 @@ func (rt *Runtime) validate(env graph.Envelope) error {
 // injectPropertySpec handles additive MUTATE: if the target field is not on the node but IS
 // declared as mutable in the ontology type definition, inject the PropertySpec so fold can create it.
 // This allows new optional properties (added in later ontology versions) to be set on existing nodes.
+//
+// Safe to call when rt.registry is nil (no-op return); callers such as
+// bumpSessionLocalT invoke this regardless of whether the kernel was started
+// with --ontology, so the nil-guard prevents a panic in registry-less mode.
 func (rt *Runtime) injectPropertySpec(env graph.Envelope, node graph.Node) graph.Envelope {
 	if env.PropertySpec != nil {
 		return env // already set (e.g. during replay)
+	}
+	if rt.registry == nil {
+		return env // registry-less mode — nothing to inject from
 	}
 	if _, hasProp := node.Properties[env.Field]; hasProp {
 		return env // field already on node — standard MUTATE path

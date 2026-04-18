@@ -24,6 +24,10 @@ const (
 	WF13 RewriteCategory = "WF13" // Promotion
 	WF14 RewriteCategory = "WF14" // Implementation
 	WF15 RewriteCategory = "WF15" // Semantic (open, contract_urn required)
+	WF16 RewriteCategory = "WF16" // Projection (S4 output relations)
+	WF17 RewriteCategory = "WF17" // Reactive (Watch/React/Guard)
+	WF18 RewriteCategory = "WF18" // Annotation (tagging, claims)
+	WF19 RewriteCategory = "WF19" // Session-local T counter (M1 chrono)
 )
 
 // PortColor classifies a port's semantic domain.

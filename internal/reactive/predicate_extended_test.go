@@ -289,3 +289,65 @@ func TestPredicate_BackwardCompat_NoContextForOldKinds(t *testing.T) {
 		t.Errorf("fires_at must still work via the context-less entry point")
 	}
 }
+
+// TestPredicate_WhenCapability_ContextlessFailsClosed — the documented
+// contract says when_capability fails closed via the context-less
+// EvaluateThookPredicate entry point (no ctx.SessionURN available to
+// resolve the occupant). Regression for PR #16 review (Copilot).
+func TestPredicate_WhenCapability_ContextlessFailsClosed(t *testing.T) {
+	state := capState()
+	pred := map[string]any{"kind": "when_capability", "cap_urn": "urn:moos:role:superadmin"}
+	if EvaluateThookPredicate(pred, state, 0) {
+		t.Errorf("when_capability via context-less EvaluateThookPredicate must fail closed")
+	}
+}
+
+// TestPredicate_WhenCapability_NonSessionContext — if ctx.SessionURN
+// points at a node that isn't a session, fail closed.
+func TestPredicate_WhenCapability_NonSessionContext(t *testing.T) {
+	state := capState()
+	ctx := EvalContext{SessionURN: "urn:moos:user:sam"} // user, not session
+	pred := map[string]any{"kind": "when_capability", "cap_urn": "urn:moos:role:superadmin"}
+	if EvaluateThookPredicateWithContext(pred, state, 0, ctx) {
+		t.Errorf("when_capability with non-session ctx.SessionURN must fail closed")
+	}
+}
+
+// TestPredicate_WhenCapability_StaleOccupant — has-occupant points at a
+// URN that no longer exists. The evaluator must not grant based on a
+// stale link.
+func TestPredicate_WhenCapability_StaleOccupant(t *testing.T) {
+	state := capState()
+	delete(state.Nodes, "urn:moos:user:sam")
+	ctx := EvalContext{SessionURN: "urn:moos:session:sam.hp-laptop"}
+	pred := map[string]any{"kind": "when_capability", "cap_urn": "urn:moos:role:superadmin"}
+	if EvaluateThookPredicateWithContext(pred, state, 0, ctx) {
+		t.Errorf("when_capability with stale occupant (target absent) must fail closed")
+	}
+}
+
+// TestPredicate_WhenCapability_MissingCapNode — cap_urn well-formed but
+// the target role/capability node has been deleted. Fail closed.
+func TestPredicate_WhenCapability_MissingCapNode(t *testing.T) {
+	state := capState()
+	delete(state.Nodes, "urn:moos:role:superadmin")
+	ctx := EvalContext{SessionURN: "urn:moos:session:sam.hp-laptop"}
+	pred := map[string]any{"kind": "when_capability", "cap_urn": "urn:moos:role:superadmin"}
+	if EvaluateThookPredicateWithContext(pred, state, 0, ctx) {
+		t.Errorf("when_capability with missing cap_urn target node must fail closed")
+	}
+}
+
+// TestPredicate_WhenCapability_WrongTgtPort — has-occupant relation must
+// also close on TgtPort=is-occupant-of. Otherwise, fail closed.
+func TestPredicate_WhenCapability_WrongTgtPort(t *testing.T) {
+	state := capState()
+	rel := state.Relations["r1"]
+	rel.TgtPort = "bogus"
+	state.Relations["r1"] = rel
+	ctx := EvalContext{SessionURN: "urn:moos:session:sam.hp-laptop"}
+	pred := map[string]any{"kind": "when_capability", "cap_urn": "urn:moos:role:superadmin"}
+	if EvaluateThookPredicateWithContext(pred, state, 0, ctx) {
+		t.Errorf("when_capability must reject relations that don't close the has-occupant port pair")
+	}
+}

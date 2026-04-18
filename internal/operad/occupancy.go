@@ -18,7 +18,7 @@ import "moos/kernel/internal/graph"
 // §M12 admin chain:
 //
 //	actor (session OR user OR agent)
-//	  -- (if session) has-occupant --> principal
+//	  -- (if session) has-occupant --> principal (user | agent)
 //	  -- WF02 governs --> role:superadmin
 //
 // Superadmin role is identified strictly by URN equality against
@@ -31,37 +31,64 @@ import "moos/kernel/internal/graph"
 // admin-capability check walks WF02 governs relations into it.
 const superadminRoleURN graph.URN = "urn:moos:role:superadmin"
 
+// principalTypes enumerates the node type_ids that may act as a principal
+// in the §M12 chain. Any other type_id on the actor (or on the resolved
+// occupant) fails the admin check closed.
+var principalTypes = map[graph.TypeID]struct{}{
+	"user":  {},
+	"agent": {},
+}
+
 // ResolveSessionOccupant walks the WF19 has-occupant relation outbound from
 // a session node and returns the principal URN (user or agent) it points at.
 //
 // Returns (urn, true) on success; (zero, false) if:
-//   - the session node doesn't exist
-//   - the session has no has-occupant relation (unoccupied)
+//   - the session URN is empty or the node is missing
+//   - the node exists but is not a type_id=="session"
+//   - the session has no well-formed has-occupant relation (unoccupied)
 //   - the target of has-occupant is missing from state
+//   - the target's type_id is not a recognised principal (user | agent)
 //
 // Pure function — no locking. Caller passes a state snapshot.
 //
-// v3.10-aware: the walk matches on SrcPort=="has-occupant" so it works
-// against any WF (WF19 canonical; future WFs that adopt the same port
-// name would also compose). Multiple has-occupant relations for one
-// session is a doctrine violation — v3.10 says "exactly one at a time",
-// but we return the first one we find rather than panicking; callers
-// that need stricter semantics can fold over the full state.
+// v3.10-aware: the walk requires BOTH SrcPort=="has-occupant" AND
+// TgtPort=="is-occupant-of" to match, which tightens against accidental
+// matches where another relation happened to reuse one of the port names.
+// Multiple has-occupant relations for a single session is a doctrine
+// violation; we return the first one found in the state's relation map
+// (Go map iteration order is randomized, so this is not stable under
+// conflict — callers that care about the doctrine violation should
+// detect duplicates explicitly).
 func ResolveSessionOccupant(state graph.GraphState, sessionURN graph.URN) (graph.URN, bool) {
 	if sessionURN == "" {
 		return "", false
 	}
-	if _, ok := state.Nodes[sessionURN]; !ok {
+	sessionNode, ok := state.Nodes[sessionURN]
+	if !ok {
 		return "", false
 	}
+	// Tighten: the helper is documented as session-specific. If the URN
+	// happens to match a non-session node, fail closed rather than silently
+	// resolving against whatever has-occupant relation points out of it.
+	if sessionNode.TypeID != "session" {
+		return "", false
+	}
+
 	for _, rel := range state.Relations {
 		if rel.SrcURN != sessionURN {
 			continue
 		}
-		if rel.SrcPort != "has-occupant" {
+		// Match on BOTH sides of the WF19 port pair to avoid false positives
+		// from any future WF that reuses one of the port names.
+		if rel.SrcPort != "has-occupant" || rel.TgtPort != "is-occupant-of" {
 			continue
 		}
-		if _, ok := state.Nodes[rel.TgtURN]; !ok {
+		tgt, ok := state.Nodes[rel.TgtURN]
+		if !ok {
+			continue // stale LINK; skip
+		}
+		// Tighten: only user / agent are valid principals per WF19 v3.10.
+		if _, isPrincipal := principalTypes[tgt.TypeID]; !isPrincipal {
 			continue
 		}
 		return rel.TgtURN, true
@@ -80,7 +107,13 @@ func ResolveSessionOccupant(state graph.GraphState, sessionURN graph.URN) (graph
 //	  -- WF02 governs --> urn:moos:role:superadmin
 //
 // Fail-closed on any missing hop. An empty actor URN, unknown actor node,
-// unoccupied session, or absent superadmin role relation all return false.
+// unoccupied session, principal of an unrecognised type, missing
+// superadmin role, or absent WF02 relation all return false.
+//
+// The WF02 match is strict on both sides: RewriteCategory == WF02,
+// SrcPort == "governs", TgtPort == "governed-by", TgtURN == superadmin.
+// Relations that match only a subset (e.g. a stale link or a port
+// collision) are ignored.
 //
 // Pure function — no locking, no IO.
 //
@@ -99,31 +132,41 @@ func CheckAdminCapability(state graph.GraphState, actor graph.URN) bool {
 		return false
 	}
 
-	// If actor is a session, hop through has-occupant to the principal.
+	// Hoist the superadmin existence check out of the relation loop —
+	// if the role node itself is missing, no WF02 link can grant admin
+	// authority (PR #13 review — Gemini).
+	if _, ok := state.Nodes[superadminRoleURN]; !ok {
+		return false
+	}
+
+	// Resolve the principal. If actor is a session, hop through has-occupant;
+	// otherwise the actor IS the principal and must be user|agent.
 	principal := actor
+	principalNode := actorNode
 	if actorNode.TypeID == "session" {
 		occ, ok := ResolveSessionOccupant(state, actor)
 		if !ok {
 			return false // unoccupied session → no one to check
 		}
 		principal = occ
+		principalNode = state.Nodes[principal]
+	}
+	if _, isPrincipal := principalTypes[principalNode.TypeID]; !isPrincipal {
+		return false
 	}
 
-	// Walk WF02 governs outbound from the principal; look for the
-	// superadmin role URN as the target.
+	// Strict WF02 match: rewrite_category + src/tgt ports + target URN.
 	for _, rel := range state.Relations {
 		if rel.SrcURN != principal {
 			continue
 		}
-		if rel.SrcPort != "governs" {
+		if rel.RewriteCategory != graph.WF02 {
+			continue
+		}
+		if rel.SrcPort != "governs" || rel.TgtPort != "governed-by" {
 			continue
 		}
 		if rel.TgtURN == superadminRoleURN {
-			// Verify the target node actually exists in state — otherwise
-			// the LINK is stale and we should fail closed.
-			if _, ok := state.Nodes[superadminRoleURN]; !ok {
-				return false
-			}
 			return true
 		}
 	}

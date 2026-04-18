@@ -172,31 +172,46 @@ func evaluateMapWithContext(p map[string]any, state *graph.GraphState, currentT 
 
 	case "when_capability":
 		// ctx.SessionURN --has-occupant--> principal --WF02 governs--> cap_urn
-		// Missing context, cap_urn, session node, or WF02 chain → false.
+		// Missing context, cap_urn, non-session context URN, stale occupant,
+		// or missing WF02 chain → false. Tightened vs. original (PR #16
+		// review — Copilot):
+		//   - Verify ctx.SessionURN is actually a type_id=="session" node.
+		//   - Match BOTH ports (has-occupant / is-occupant-of) so the walk
+		//     doesn't trip on unrelated links that happen to reuse one port name.
+		//   - Verify the occupant target node exists in state (stale LINK
+		//     otherwise grants capability via a deleted principal).
+		//   - Verify the cap_urn target node exists.
 		capURN, hasCap := p["cap_urn"].(string)
 		if !hasCap || capURN == "" || ctx.SessionURN == "" {
 			return false
 		}
-		if _, ok := state.Nodes[ctx.SessionURN]; !ok {
+		sessionNode, ok := state.Nodes[ctx.SessionURN]
+		if !ok || sessionNode.TypeID != "session" {
 			return false
 		}
 		var occupant graph.URN
 		for _, rel := range state.Relations {
-			if rel.SrcURN == ctx.SessionURN && rel.SrcPort == "has-occupant" {
-				occupant = rel.TgtURN
-				break
+			if rel.SrcURN != ctx.SessionURN {
+				continue
 			}
+			if rel.SrcPort != "has-occupant" || rel.TgtPort != "is-occupant-of" {
+				continue
+			}
+			if _, ok := state.Nodes[rel.TgtURN]; !ok {
+				continue // stale LINK; skip
+			}
+			occupant = rel.TgtURN
+			break
 		}
 		if occupant == "" {
 			return false
 		}
 		target := graph.URN(capURN)
+		if _, ok := state.Nodes[target]; !ok {
+			return false
+		}
 		for _, rel := range state.Relations {
 			if rel.SrcURN == occupant && rel.SrcPort == "governs" && rel.TgtURN == target {
-				// Stale link (target node absent) fails closed.
-				if _, ok := state.Nodes[target]; !ok {
-					return false
-				}
 				return true
 			}
 		}

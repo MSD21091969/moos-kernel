@@ -59,7 +59,7 @@ func stateWithOccupancy() graph.GraphState {
 		Relations: map[graph.URN]graph.Relation{
 			"urn:moos:rel:sam.hp-laptop.has-occupant.user-sam": {
 				URN:             "urn:moos:rel:sam.hp-laptop.has-occupant.user-sam",
-				RewriteCategory: "WF19",
+				RewriteCategory: graph.WF19,
 				SrcURN:          "urn:moos:session:sam.hp-laptop",
 				SrcPort:         "has-occupant",
 				TgtURN:          "urn:moos:user:sam",
@@ -114,7 +114,7 @@ func stateWithAdminChain() graph.GraphState {
 	}
 	state.Relations["urn:moos:rel:sam.governs.superadmin"] = graph.Relation{
 		URN:             "urn:moos:rel:sam.governs.superadmin",
-		RewriteCategory: "WF02",
+		RewriteCategory: graph.WF02,
 		SrcURN:          "urn:moos:user:sam",
 		SrcPort:         "governs",
 		TgtURN:          "urn:moos:role:superadmin",
@@ -168,5 +168,124 @@ func TestCheckAdminCapability_EmptyActor(t *testing.T) {
 	state := stateWithAdminChain()
 	if CheckAdminCapability(state, "") {
 		t.Errorf("expected empty actor URN to fail admin check")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Tightening regressions from PR #13 review (Copilot)
+// -----------------------------------------------------------------------------
+
+// TestResolveSessionOccupant_RejectsNonSession — ResolveSessionOccupant
+// must fail-closed when the URN points at a node that exists but isn't
+// type_id=="session". Prior behaviour silently walked has-occupant off any
+// node.
+func TestResolveSessionOccupant_RejectsNonSession(t *testing.T) {
+	state := stateWithOccupancy()
+	// user:sam exists; pretend someone passed its URN by mistake.
+	_, ok := ResolveSessionOccupant(state, "urn:moos:user:sam")
+	if ok {
+		t.Errorf("expected ResolveSessionOccupant to reject non-session URN")
+	}
+}
+
+// TestResolveSessionOccupant_RequiresBothPorts — the WF19 port pair must
+// match on both sides. A relation with SrcPort=has-occupant but a different
+// TgtPort is ignored.
+func TestResolveSessionOccupant_RequiresBothPorts(t *testing.T) {
+	state := stateWithOccupancy()
+	// Corrupt the TgtPort so the pair no longer matches on both sides.
+	rel := state.Relations["urn:moos:rel:sam.hp-laptop.has-occupant.user-sam"]
+	rel.TgtPort = "some-other-port"
+	state.Relations["urn:moos:rel:sam.hp-laptop.has-occupant.user-sam"] = rel
+
+	_, ok := ResolveSessionOccupant(state, "urn:moos:session:sam.hp-laptop")
+	if ok {
+		t.Errorf("expected ResolveSessionOccupant to require matching TgtPort")
+	}
+}
+
+// TestResolveSessionOccupant_RejectsNonPrincipalTarget — the target of
+// has-occupant must be a user or agent. Any other type_id fails closed.
+func TestResolveSessionOccupant_RejectsNonPrincipalTarget(t *testing.T) {
+	state := stateWithOccupancy()
+	// Retarget has-occupant at a type_id that isn't user/agent.
+	state.Nodes["urn:moos:program:sam.bogus"] = graph.Node{
+		URN: "urn:moos:program:sam.bogus", TypeID: "program",
+		Properties: map[string]graph.Property{"title": {Value: "not a principal", Mutability: "immutable"}},
+	}
+	state.Relations["rel-bogus"] = graph.Relation{
+		URN:             "rel-bogus",
+		RewriteCategory: graph.WF19,
+		SrcURN:          "urn:moos:session:sam.idle",
+		SrcPort:         "has-occupant",
+		TgtURN:          "urn:moos:program:sam.bogus",
+		TgtPort:         "is-occupant-of",
+	}
+	_, ok := ResolveSessionOccupant(state, "urn:moos:session:sam.idle")
+	if ok {
+		t.Errorf("expected ResolveSessionOccupant to reject program-typed target (not a user|agent)")
+	}
+}
+
+// TestCheckAdminCapability_MissingSuperadminRoleFailsClosed — the admin
+// check must fail closed when the superadmin role node itself is absent.
+func TestCheckAdminCapability_MissingSuperadminRoleFailsClosed(t *testing.T) {
+	state := stateWithAdminChain()
+	delete(state.Nodes, "urn:moos:role:superadmin")
+	// The WF02 relation still points at the (now missing) role. Admin check
+	// must still fail — the link is stale.
+	if CheckAdminCapability(state, "urn:moos:user:sam") {
+		t.Errorf("expected admin check to fail when superadmin role node is absent")
+	}
+}
+
+// TestCheckAdminCapability_RequiresWF02Category — the governance link must
+// carry RewriteCategory=WF02. A link with the same ports but a different
+// WF should be ignored.
+func TestCheckAdminCapability_RequiresWF02Category(t *testing.T) {
+	state := stateWithAdminChain()
+	rel := state.Relations["urn:moos:rel:sam.governs.superadmin"]
+	rel.RewriteCategory = graph.WF01 // wrong category
+	state.Relations["urn:moos:rel:sam.governs.superadmin"] = rel
+
+	if CheckAdminCapability(state, "urn:moos:user:sam") {
+		t.Errorf("expected admin check to require WF02 rewrite_category")
+	}
+}
+
+// TestCheckAdminCapability_RequiresGovernedByTgtPort — the WF02 link must
+// close on both port names. A link with a different TgtPort is ignored.
+func TestCheckAdminCapability_RequiresGovernedByTgtPort(t *testing.T) {
+	state := stateWithAdminChain()
+	rel := state.Relations["urn:moos:rel:sam.governs.superadmin"]
+	rel.TgtPort = "bogus-port"
+	state.Relations["urn:moos:rel:sam.governs.superadmin"] = rel
+
+	if CheckAdminCapability(state, "urn:moos:user:sam") {
+		t.Errorf("expected admin check to require TgtPort=governed-by")
+	}
+}
+
+// TestCheckAdminCapability_RejectsNonPrincipalActor — if the actor URN
+// points at a node that's neither session nor a recognised principal
+// (user|agent), the check fails closed.
+func TestCheckAdminCapability_RejectsNonPrincipalActor(t *testing.T) {
+	state := stateWithAdminChain()
+	// Add a governance_proposal node and point the WF02 relation at it.
+	// The proposal exists, the role exists, but proposal isn't a principal.
+	state.Nodes["urn:moos:governance_proposal:sam.x"] = graph.Node{
+		URN: "urn:moos:governance_proposal:sam.x", TypeID: "governance_proposal",
+		Properties: map[string]graph.Property{"title": {Value: "x", Mutability: "immutable"}},
+	}
+	state.Relations["rel-proposal-governs"] = graph.Relation{
+		URN:             "rel-proposal-governs",
+		RewriteCategory: graph.WF02,
+		SrcURN:          "urn:moos:governance_proposal:sam.x",
+		SrcPort:         "governs",
+		TgtURN:          "urn:moos:role:superadmin",
+		TgtPort:         "governed-by",
+	}
+	if CheckAdminCapability(state, "urn:moos:governance_proposal:sam.x") {
+		t.Errorf("expected admin check to reject non-principal actor (governance_proposal)")
 	}
 }

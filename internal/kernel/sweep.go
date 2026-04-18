@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"moos/kernel/internal/graph"
@@ -42,13 +43,24 @@ import (
 
 // sweepTDay0 is T=0 as UTC: 2025-11-01 00:00 CEST = 2025-10-31 23:00 UTC.
 // Matches transport/server.go tDay0 so both derive the same T-day.
+//
+// TODO(drift): duplicated in transport/server.go tDay0 and cmd/moos/main.go
+// tDay. A future refactor should extract a shared package-level helper so
+// the epoch is defined exactly once (PR #12 review — Copilot + Gemini).
 var sweepTDay0 = time.Date(2025, 10, 31, 23, 0, 0, 0, time.UTC)
 
 // CurrentSweepTDay returns the current calendar T-day (wall-clock derived).
 // Exported so callers that want to trigger a manual sweep without the
 // goroutine can pass the same T to SweepOnce.
+//
+// Uses integer duration division (Duration / 24h) rather than
+// Duration.Hours()/24 to avoid float64 rounding errors near day boundaries.
+// A tick that crosses midnight UTC must flip to the next T-day atomically;
+// the float version could yield an off-by-one when Sub returned a value
+// like 86399.999999999 / 24 ≈ 3599.99999... truncating down by one (PR
+// #12 review — Copilot).
 func CurrentSweepTDay() int {
-	return int(time.Now().UTC().Sub(sweepTDay0).Hours() / 24)
+	return int(time.Since(sweepTDay0) / (24 * time.Hour))
 }
 
 // DefaultSweepActor is the actor URN used by the sweep when ADDing
@@ -61,20 +73,27 @@ const DefaultSweepActor graph.URN = "urn:moos:kernel:sweep"
 // governance_proposal ADD envelopes for every pending t_hook whose
 // predicate evaluates true at currentT.
 //
-// Pure: does not mutate state or perform IO. The caller (typically
-// Runtime.sweepOnce) is responsible for applying the returned envelopes
-// atomically via ApplyProgram.
+// Deterministic (given state + currentT + actor + baseLogSeq + now): does
+// not mutate state or perform IO. The caller (Runtime.SweepTick) passes
+// a snapshot-time `now` so all proposals in one sweep share a single
+// timestamp; this also makes the function testable without a clock stub.
 //
 // Idempotency: hooks that already have a matching governance_proposal
 // (by source_t_hook_urn equality) are skipped.
 //
 // baseLogSeq is used only for URN disambiguation across hooks within a
 // single tick — it's appended to the URN suffix so two hooks firing in
-// the same tick get distinct proposal URNs. The actual log sequencing
-// happens at Apply time.
-func SweepOnce(state graph.GraphState, currentT int, actor graph.URN, baseLogSeq int64) []graph.Envelope {
+// the same tick get distinct proposal URNs. The offset starts at 1 so
+// the sequence matches the log_seq that ApplyProgram will assign when
+// the envelopes actually append (PR #12 review — Gemini).
+func SweepOnce(state graph.GraphState, currentT int, actor graph.URN, baseLogSeq int64, now time.Time) []graph.Envelope {
 	// Build the idempotency set: hooks that already have a proposal.
 	// Single O(nodes) pass before the main loop.
+	//
+	// TODO(perf): this is O(nodes) per tick. A guarded-node index
+	// maintained during ADD/UNLINK would reduce to O(proposals); the
+	// same index can subsume the t_hook walk below (PR #12 review —
+	// Gemini, Copilot).
 	proposedHooks := make(map[graph.URN]struct{})
 	for _, n := range state.Nodes {
 		if n.TypeID != "governance_proposal" {
@@ -92,6 +111,7 @@ func SweepOnce(state graph.GraphState, currentT int, actor graph.URN, baseLogSeq
 
 	var envelopes []graph.Envelope
 	emitted := int64(0)
+	nowStr := now.UTC().Format(time.RFC3339)
 
 	for _, n := range state.Nodes {
 		if n.TypeID != "t_hook" {
@@ -106,55 +126,53 @@ func SweepOnce(state graph.GraphState, currentT int, actor graph.URN, baseLogSeq
 		if !hasPred || predProp.Value == nil {
 			continue
 		}
-		// Evaluate. EvaluateThookPredicate handles the json round-trip
-		// when the value arrives from log replay as map[string]any or
-		// any other shape; returns false on malformed / unknown kinds.
-		stateCopy := state // SweepOnce doesn't mutate; pass addr-of-local.
-		if !reactive.EvaluateThookPredicate(predProp.Value, &stateCopy, currentT) {
+		// Evaluate against the state we received. EvaluateThookPredicate
+		// handles the json round-trip when the value arrives from log
+		// replay as map[string]any; returns false on malformed kinds.
+		// (Previously took &stateCopy to defend against mutation inside
+		// the evaluator — the evaluator is pure, so passing &state directly
+		// is both correct and avoids a misleading shallow copy whose
+		// underlying maps still aliased the original.)
+		if !reactive.EvaluateThookPredicate(predProp.Value, &state, currentT) {
 			continue
 		}
 
 		// Compose the proposal envelope. The URN encodes the source hook
 		// slug + calendar-T + sequence offset so operators can trace it.
+		// Offset starts at 1 to align with the log_seq ApplyProgram will
+		// later assign to the envelope (baseLogSeq+1, baseLogSeq+2, ...).
 		hookSlug := slugFromURN(n.URN)
-		proposalURN := graph.URN(fmt.Sprintf("urn:moos:proposal:kernel.%s-t%d-seq%d", hookSlug, currentT, baseLogSeq+emitted))
 		emitted++
+		proposalURN := graph.URN(fmt.Sprintf("urn:moos:proposal:kernel.%s-t%d-seq%d", hookSlug, currentT, baseLogSeq+emitted))
 
-		// Carry the react_template verbatim so an approver can see
-		// exactly what would apply if they ratified the proposal.
-		var reactTemplate any
-		if p, ok := n.Properties["react_template"]; ok {
-			reactTemplate = p.Value
-		}
-		// Owner is the natural breadcrumb back to the program that
-		// owns the firing hook.
-		var ownerURN any
-		if p, ok := n.Properties["owner_urn"]; ok {
-			ownerURN = p.Value
-		}
-
-		now := time.Now().UTC().Format(time.RFC3339)
 		title := fmt.Sprintf("Fire t_hook %s at T=%d", n.URN, currentT)
+
+		// Extras — only set when the source hook actually carries them, so
+		// we don't ADD a governance_proposal with nil-valued breadcrumbs
+		// that give approvers a false sense of traceability (PR #12
+		// review — Copilot).
+		props := map[string]graph.Property{
+			// Required immutable property per v3.9 ontology.
+			"title": {Value: title, Mutability: "immutable"},
+			// Mutable-with-principal-scope per spec; approver flips this.
+			"status":            {Value: "pending", Mutability: "mutable", AuthorityScope: "principal"},
+			"created_at":        {Value: nowStr, Mutability: "immutable"},
+			"source_t_hook_urn": {Value: string(n.URN), Mutability: "immutable"},
+			"fires_at_t":        {Value: currentT, Mutability: "immutable"},
+		}
+		if p, ok := n.Properties["react_template"]; ok && p.Value != nil {
+			props["proposed_envelope"] = graph.Property{Value: p.Value, Mutability: "immutable"}
+		}
+		if p, ok := n.Properties["owner_urn"]; ok && p.Value != nil {
+			props["owner_urn"] = graph.Property{Value: p.Value, Mutability: "immutable"}
+		}
 
 		envelopes = append(envelopes, graph.Envelope{
 			RewriteType: graph.ADD,
 			Actor:       actor,
 			NodeURN:     proposalURN,
 			TypeID:      "governance_proposal",
-			Properties: map[string]graph.Property{
-				// Required immutable property per v3.9 ontology.
-				"title": {Value: title, Mutability: "immutable"},
-				// Mutable-with-principal-scope per spec; approver flips this.
-				"status": {Value: "pending", Mutability: "mutable", AuthorityScope: "principal"},
-				// Extras (not in governance_proposal spec but ValidateADD allows them).
-				// Kept free-form; if a v3.10 bump adds these to the spec they'll
-				// flow in transparently.
-				"created_at":        {Value: now, Mutability: "immutable"},
-				"source_t_hook_urn": {Value: string(n.URN), Mutability: "immutable"},
-				"fires_at_t":        {Value: currentT, Mutability: "immutable"},
-				"proposed_envelope": {Value: reactTemplate, Mutability: "immutable"},
-				"owner_urn":         {Value: ownerURN, Mutability: "immutable"},
-			},
+			Properties:  props,
 		})
 	}
 
@@ -177,11 +195,31 @@ func slugFromURN(urn graph.URN) string {
 // Runtime integration: the goroutine loop and manual-trigger helper
 // ----------------------------------------------------------------------------
 
+// sweepActorMu guards the sweepActor field on Runtime. Gemini flagged the
+// bare read in SweepTick as a data race against SetSweepActor; in practice
+// the race is benign (URN is a string and the runtime is single-writer at
+// startup), but Go's race detector would catch it and it costs nothing to
+// fix (PR #12 review — Gemini).
+var sweepActorMu sync.RWMutex
+
 // SetSweepActor overrides the actor URN used by the sweep goroutine.
-// Must be called before RunTimedSweep is started; not concurrency-safe.
-// If never called, DefaultSweepActor is used.
+// Thread-safe: may be called at any point in the runtime lifecycle.
+// If never called, DefaultSweepActor is used at tick time.
 func (rt *Runtime) SetSweepActor(actor graph.URN) {
+	sweepActorMu.Lock()
+	defer sweepActorMu.Unlock()
 	rt.sweepActor = actor
+}
+
+// sweepActorLocked reads the current sweep actor under the package mutex.
+// Returns the default when the runtime's field is empty.
+func (rt *Runtime) sweepActorLocked() graph.URN {
+	sweepActorMu.RLock()
+	defer sweepActorMu.RUnlock()
+	if rt.sweepActor == "" {
+		return DefaultSweepActor
+	}
+	return rt.sweepActor
 }
 
 // RunTimedSweep runs the sweep at the given interval until ctx is canceled.
@@ -218,12 +256,9 @@ func (rt *Runtime) RunTimedSweep(ctx context.Context, interval time.Duration) {
 // the next tick will retry. A batch failure leaves state unchanged
 // (ApplyProgram is all-or-nothing).
 func (rt *Runtime) SweepTick() {
-	actor := rt.sweepActor
-	if actor == "" {
-		actor = DefaultSweepActor
-	}
+	actor := rt.sweepActorLocked()
 	state := rt.State()
-	envelopes := SweepOnce(state, CurrentSweepTDay(), actor, rt.logSeq.Load())
+	envelopes := SweepOnce(state, CurrentSweepTDay(), actor, rt.logSeq.Load(), time.Now())
 	if len(envelopes) == 0 {
 		return
 	}

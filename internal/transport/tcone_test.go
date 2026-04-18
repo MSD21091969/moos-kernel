@@ -329,3 +329,45 @@ func TestTCone_DefaultAtT(t *testing.T) {
 		t.Errorf("expected numeric t in response, got %T: %v", resp["t"], resp["t"])
 	}
 }
+
+// TestTCone_InvalidAtParam — non-integer at query param returns 400.
+// Regression for PR #14 review (Copilot — missing negative test).
+func TestTCone_InvalidAtParam(t *testing.T) {
+	srv := serverWithState(stateForTCone())
+	mux := muxWithTCone(srv)
+
+	req := httptest.NewRequest("GET",
+		"/t-cone?session=urn:moos:session:sam.hp-laptop&at=not-a-number", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid at param, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTCone_NonStringSeatRole — seat_role stored as a non-string (e.g.
+// graph.URN) must still route to the live-check correctly via
+// stringPropValue. Regression for PR #14 review (Gemini).
+func TestTCone_NonStringSeatRole(t *testing.T) {
+	state := stateForTCone()
+	// Store seat_role as a graph.URN (alias for string but distinct type)
+	// to mirror what some ADD paths produce.
+	n := state.Nodes["urn:moos:session:sam.hp-laptop"]
+	n.Properties["seat_role"] = graph.Property{
+		Value:      graph.URN("occupier"),
+		Mutability: "mutable",
+	}
+	state.Nodes["urn:moos:session:sam.hp-laptop"] = n
+
+	srv := serverWithState(state)
+	mux := muxWithTCone(srv)
+	req := httptest.NewRequest("GET",
+		"/t-cone?session=urn:moos:session:sam.hp-laptop&at=250", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with graph.URN-valued seat_role, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

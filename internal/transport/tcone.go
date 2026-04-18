@@ -104,16 +104,15 @@ func (s *Server) handleGetTCone(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("URN %s is not a session (type=%s)", sessionURN, sessionNode.TypeID))
 		return
 	}
-	seatRole := ""
-	if p, ok := sessionNode.Properties["seat_role"]; ok {
-		seatRole, _ = p.Value.(string)
-	}
-	// Fall back to legacy `role` property if seat_role is empty — v3.10
-	// keeps both names accepted; v3.11 removes `role`.
+	// Prefer seat_role; fall back to legacy `role` (v3.10 accepts both;
+	// v3.11 removes `role`). fmt.Sprint is used instead of a raw string
+	// assertion because the property value may arrive as graph.URN or
+	// another string-like alias depending on how it was stored — the raw
+	// `.(string)` form would silently return "" and misclassify the seat
+	// as not-live (PR #14 review — Gemini).
+	seatRole := stringPropValue(sessionNode.Properties["seat_role"])
 	if seatRole == "" {
-		if p, ok := sessionNode.Properties["role"]; ok {
-			seatRole, _ = p.Value.(string)
-		}
+		seatRole = stringPropValue(sessionNode.Properties["role"])
 	}
 	if seatRole != "occupier" && seatRole != "delegate" {
 		writeError(w, http.StatusBadRequest,
@@ -157,10 +156,10 @@ func (s *Server) handleGetTCone(w http.ResponseWriter, r *http.Request) {
 		if !reactive.EvaluateThookPredicate(predProp.Value, &state, atT) {
 			continue
 		}
-		ownerURN := ""
-		if p, ok := n.Properties["owner_urn"]; ok {
-			ownerURN, _ = p.Value.(string)
-		}
+		// owner_urn may arrive as string or graph.URN depending on how the
+		// hook was constructed — use stringPropValue so either form is
+		// accepted (PR #14 review — Gemini).
+		ownerURN := stringPropValue(n.Properties["owner_urn"])
 		if ownerURN == "" {
 			continue
 		}
@@ -234,4 +233,23 @@ func (s *Server) handleGetTCone(w http.ResponseWriter, r *http.Request) {
 		"occupant": string(occupant),
 		"nodes":    result,
 	})
+}
+
+// stringPropValue returns a node property's value coerced to string via
+// fmt.Sprint. Use this wherever a property might legitimately carry either
+// `string`, `graph.URN`, or another string-like alias — the bare
+// `value.(string)` assertion silently returns "" on graph.URN and that
+// drops the value on the floor without any error path (PR #14 review —
+// Gemini).
+//
+// If the property is absent, returns the empty string. Callers that need
+// a hard absent/present distinction should inspect the map directly.
+func stringPropValue(p graph.Property) string {
+	if p.Value == nil {
+		return ""
+	}
+	if s, ok := p.Value.(string); ok {
+		return s
+	}
+	return fmt.Sprint(p.Value)
 }

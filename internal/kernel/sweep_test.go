@@ -3,6 +3,7 @@ package kernel
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"moos/kernel/internal/graph"
 )
@@ -71,7 +72,7 @@ func sweepState() graph.GraphState {
 func TestSweepOnce_FiresMaturedHook(t *testing.T) {
 	state := sweepState()
 	actor := graph.URN("urn:moos:kernel:test.sweep")
-	envelopes := SweepOnce(state, 250, actor, 0)
+	envelopes := SweepOnce(state, 250, actor, 0, time.Unix(1700000000, 0))
 
 	if len(envelopes) != 1 {
 		t.Fatalf("expected exactly 1 envelope (hook-a ADD governance_proposal); got %d:\n%v", len(envelopes), envelopes)
@@ -120,7 +121,7 @@ func TestSweepOnce_FiresMaturedHook(t *testing.T) {
 func TestSweepOnce_IdempotencyViaExistingProposal(t *testing.T) {
 	state := sweepState()
 	// Use T=200 so hook-a fires but hook-c (already proposed) is still pending.
-	envelopes := SweepOnce(state, 200, "urn:moos:kernel:test.sweep", 0)
+	envelopes := SweepOnce(state, 200, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0))
 
 	// Exactly one envelope (for hook-a). hook-c must be skipped despite
 	// being matured.
@@ -135,7 +136,7 @@ func TestSweepOnce_IdempotencyViaExistingProposal(t *testing.T) {
 // sweep returns an empty envelope slice.
 func TestSweepOnce_NoFiresNoEnvelopes(t *testing.T) {
 	state := sweepState()
-	envelopes := SweepOnce(state, 0, "urn:moos:kernel:test.sweep", 0)
+	envelopes := SweepOnce(state, 0, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0))
 
 	if len(envelopes) != 0 {
 		t.Errorf("expected 0 envelopes at T=0; got %d:\n%v", len(envelopes), envelopes)
@@ -147,7 +148,7 @@ func TestSweepOnce_NoFiresNoEnvelopes(t *testing.T) {
 // hook-a and hook-b envelopes must be present and correctly shaped.
 func TestSweepOnce_AllFire(t *testing.T) {
 	state := sweepState()
-	envelopes := SweepOnce(state, 1000, "urn:moos:kernel:test.sweep", 0)
+	envelopes := SweepOnce(state, 1000, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0))
 
 	hooks := map[string]bool{}
 	for _, env := range envelopes {
@@ -171,7 +172,7 @@ func TestSweepOnce_AllFire(t *testing.T) {
 // what rewrite would apply if they approve.
 func TestSweepOnce_ProposalCarriesReactTemplate(t *testing.T) {
 	state := sweepState()
-	envelopes := SweepOnce(state, 250, "urn:moos:kernel:test.sweep", 0)
+	envelopes := SweepOnce(state, 250, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0))
 
 	if len(envelopes) == 0 {
 		t.Fatalf("expected at least one envelope")
@@ -209,7 +210,7 @@ func TestSweepOnce_SkipsHooksWithoutPredicate(t *testing.T) {
 		Relations: map[graph.URN]graph.Relation{},
 	}
 
-	envelopes := SweepOnce(state, 1000, "urn:moos:kernel:test.sweep", 0)
+	envelopes := SweepOnce(state, 1000, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0))
 	if len(envelopes) != 0 {
 		t.Errorf("expected 0 envelopes (hook has no predicate); got %d", len(envelopes))
 	}
@@ -255,7 +256,7 @@ func TestSweepOnce_HandlesCompoundPredicate(t *testing.T) {
 	}
 
 	// At T=220 with anchor still active → compound is false → no fire.
-	if envelopes := SweepOnce(state, 220, "urn:moos:kernel:test.sweep", 0); len(envelopes) != 0 {
+	if envelopes := SweepOnce(state, 220, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0)); len(envelopes) != 0 {
 		t.Errorf("compound predicate should be false (anchor.status=active != completed); got %d envelopes", len(envelopes))
 	}
 
@@ -264,7 +265,7 @@ func TestSweepOnce_HandlesCompoundPredicate(t *testing.T) {
 	anchor.Properties["status"] = graph.Property{Value: "completed", Mutability: "mutable"}
 	state.Nodes["urn:moos:program:sam.anchor"] = anchor
 
-	envelopes := SweepOnce(state, 220, "urn:moos:kernel:test.sweep", 0)
+	envelopes := SweepOnce(state, 220, "urn:moos:kernel:test.sweep", 0, time.Unix(1700000000, 0))
 	if len(envelopes) != 1 {
 		t.Fatalf("compound predicate satisfied; expected 1 envelope, got %d", len(envelopes))
 	}
@@ -304,7 +305,7 @@ func TestSweepOnce_UniqueProposalURNsAcrossHooks(t *testing.T) {
 		Relations: map[graph.URN]graph.Relation{},
 	}
 
-	envelopes := SweepOnce(state, 200, "urn:moos:kernel:test.sweep", 100)
+	envelopes := SweepOnce(state, 200, "urn:moos:kernel:test.sweep", 100, time.Unix(1700000000, 0))
 	if len(envelopes) != 2 {
 		t.Fatalf("expected 2 envelopes for 2 matured hooks; got %d", len(envelopes))
 	}

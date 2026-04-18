@@ -10,8 +10,9 @@ import (
 )
 
 // fakeInspect is a minimal kernel.InspectKernel that backs the handler tests
-// with a hand-built state. Only State() and Node() are exercised by the
-// /t-hook/evaluate handler; the rest stub out for interface compliance.
+// with a hand-built state. The /t-hook/evaluate handler exercises Node()
+// first (to validate URN + type_id) and then State() (to evaluate
+// predicates). The remaining methods stub out for interface compliance.
 type fakeInspect struct {
 	state graph.GraphState
 }
@@ -32,11 +33,11 @@ func (f *fakeInspect) Relation(urn graph.URN) (graph.Relation, bool) {
 	r, ok := f.state.Relations[urn]
 	return r, ok
 }
-func (f *fakeInspect) Relations() []graph.Relation          { return nil }
+func (f *fakeInspect) Relations() []graph.Relation             { return nil }
 func (f *fakeInspect) RelationsSrc(graph.URN) []graph.Relation { return nil }
 func (f *fakeInspect) RelationsTgt(graph.URN) []graph.Relation { return nil }
-func (f *fakeInspect) Log() []graph.PersistedRewrite        { return nil }
-func (f *fakeInspect) LogLen() int                         { return 0 }
+func (f *fakeInspect) Log() []graph.PersistedRewrite           { return nil }
+func (f *fakeInspect) LogLen() int                             { return 0 }
 
 // stateWithStartableHook builds a small state with t187-kernel-proper and a
 // v310-delivery.startable t_hook whose predicate mirrors the one ADDed in
@@ -127,7 +128,11 @@ func TestTHookEvaluate_FiresAtFuture(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	if fires, _ := resp["fires"].(bool); fires {
+	fires, ok := resp["fires"].(bool)
+	if !ok {
+		t.Fatalf("expected fires to be a bool in response, got %T: %v", resp["fires"], resp["fires"])
+	}
+	if fires {
 		t.Errorf("expected fires=false at T=168 with kernel-proper active; got %v", resp)
 	}
 	// JSON round-trip turns at_t into float64.
@@ -166,7 +171,11 @@ func TestTHookEvaluate_FiresWhenReady(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	if fires, _ := resp["fires"].(bool); !fires {
+	fires, ok := resp["fires"].(bool)
+	if !ok {
+		t.Fatalf("expected fires to be a bool in response, got %T: %v", resp["fires"], resp["fires"])
+	}
+	if !fires {
 		t.Errorf("expected fires=true at T=220 with kernel-proper completed; got %v", resp)
 	}
 }
@@ -227,6 +236,36 @@ func TestTHookEvaluate_NoPredicate(t *testing.T) {
 
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for t_hook without predicate, got %d", rec.Code)
+	}
+}
+
+// TestTHookEvaluate_NilPredicateValue — a t_hook whose predicate property
+// exists but carries a nil Value (e.g. MUTATEd with new_value=null) must
+// also return 422, not a spurious 200 with fires=false. Regression for PR
+// #10 review (Copilot).
+func TestTHookEvaluate_NilPredicateValue(t *testing.T) {
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:t_hook:sam.null-pred": {
+				URN:    "urn:moos:t_hook:sam.null-pred",
+				TypeID: "t_hook",
+				Properties: map[string]graph.Property{
+					"owner_urn": {Value: "urn:moos:program:sam.t187-kernel-proper", Mutability: "immutable"},
+					"predicate": {Value: nil, Mutability: "mutable"}, // explicit nil
+				},
+			},
+		},
+		Relations: map[graph.URN]graph.Relation{},
+	}
+	srv := serverWithState(state)
+	mux := muxWithTHook(srv)
+
+	req := httptest.NewRequest("GET", "/t-hook/evaluate/urn:moos:t_hook:sam.null-pred?at=200", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for t_hook with nil predicate value, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

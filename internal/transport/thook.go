@@ -36,7 +36,7 @@ import (
 //	404 — t_hook node not found
 //	400 — node exists but is not of type t_hook
 //	400 — invalid "at" query parameter
-//	422 — t_hook has no predicate property (nothing to evaluate)
+//	422 — t_hook has no predicate property, or the predicate value is nil
 //
 // The predicate evaluation itself is delegated to
 // reactive.EvaluateThookPredicate. See internal/reactive/predicate.go for
@@ -45,8 +45,11 @@ import (
 func (s *Server) handleGetTHookEvaluate(w http.ResponseWriter, r *http.Request) {
 	urn := graph.URN(r.PathValue("urn"))
 
-	state := s.inspect.State()
-	node, ok := state.Nodes[urn]
+	// Validate the node first via the cheap single-node lookup; only fetch
+	// the full graph state once we're sure we have a well-formed t_hook to
+	// evaluate. This avoids an O(N) state clone on requests that will 404
+	// or 400 anyway.
+	node, ok := s.inspect.Node(urn)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("t_hook not found: %s", urn))
 		return
@@ -56,9 +59,11 @@ func (s *Server) handleGetTHookEvaluate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// A t_hook without a predicate (field missing OR explicit nil value) has
+	// nothing to evaluate. Both cases return 422 for consistency.
 	predProp, hasPred := node.Properties["predicate"]
-	if !hasPred {
-		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("t_hook %s has no predicate property — nothing to evaluate", urn))
+	if !hasPred || predProp.Value == nil {
+		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("t_hook %s has no predicate value — nothing to evaluate", urn))
 		return
 	}
 
@@ -73,6 +78,9 @@ func (s *Server) handleGetTHookEvaluate(w http.ResponseWriter, r *http.Request) 
 		atT = parsed
 	}
 
+	// Only fetch the full state when we're about to use it. Predicates like
+	// after_urn/before_urn read other nodes by URN.
+	state := s.inspect.State()
 	fires := reactive.EvaluateThookPredicate(predProp.Value, &state, atT)
 
 	resp := map[string]any{

@@ -123,6 +123,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /t-hook/evaluate/{urn}", s.handleGetTHookEvaluate)
 	mux.HandleFunc("POST /t-hook/evaluate", s.handleBatchTHookEvaluate)
 
+	// T-cone projection (§M15 — occupant's view of nodes with open hooks)
+	mux.HandleFunc("GET /t-cone", s.handleGetTCone)
+
 	return s.corsMiddleware(mux)
 }
 

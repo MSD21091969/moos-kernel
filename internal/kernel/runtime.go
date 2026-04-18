@@ -40,6 +40,11 @@ type Runtime struct {
 	subscribers  map[string]chan graph.PersistedRewrite
 
 	logSeq atomic.Int64
+
+	// sweepActor is the actor URN the time-driven sweep uses when emitting
+	// governance_proposal envelopes. Empty value → DefaultSweepActor. See
+	// SetSweepActor / RunTimedSweep in sweep.go.
+	sweepActor graph.URN
 }
 
 // NewRuntime creates a Runtime by replaying the full store into memory.

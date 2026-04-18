@@ -35,6 +35,8 @@ func main() {
 	doSeed := flag.Bool("seed", false, "seed infrastructure nodes from flags")
 	seedUser := flag.String("seed-user", "sam", "username for seed node")
 	seedWS := flag.String("seed-ws", "hp-laptop", "workstation name for seed node")
+	sweepInterval := flag.Duration("sweep-interval", 30*time.Second,
+		"t_hook sweep tick interval (0 disables; default 30s). Each tick evaluates all pending t_hooks and emits a governance_proposal per firing.")
 	flag.Parse()
 
 	// --- Load registry ---
@@ -121,6 +123,18 @@ func main() {
 			mcpSrv.HandleStdio(ctx, os.Stdin, os.Stdout)
 		}()
 	}
+
+	// --- Start time-driven t_hook sweep (§M14 hook-predicates, round-9 M2) ---
+	// Every --sweep-interval, walk pending t_hooks and ADD a governance_proposal
+	// per hook whose predicate fires. Proposals sit at status=pending awaiting
+	// admin ratification. --sweep-interval=0 disables.
+	//
+	// The sweep actor URN defaults to urn:moos:kernel:sweep; when seeding is
+	// enabled we override to the specific kernel URN for traceability.
+	if *doSeed {
+		rt.SetSweepActor(graph.URN(fmt.Sprintf("urn:moos:kernel:%s.primary", *seedWS)))
+	}
+	go rt.RunTimedSweep(ctx, *sweepInterval)
 
 	// --- Graceful shutdown ---
 	quit := make(chan os.Signal, 1)

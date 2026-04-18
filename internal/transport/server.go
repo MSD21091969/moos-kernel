@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"moos/kernel/internal/fold"
 	"moos/kernel/internal/graph"
 	"moos/kernel/internal/hdc"
 	"moos/kernel/internal/kernel"
@@ -25,6 +26,12 @@ type Server struct {
 	write    kernel.WriteKernel
 	observe  kernel.ObservableKernel
 	registry *operad.Registry
+
+	// altSvc, if non-empty, is emitted as the Alt-Svc response header to
+	// advertise an HTTP/3 endpoint. Set via SetAltSvc from main.go once the
+	// QUIC listener's actual UDP port is known. Empty means no Alt-Svc
+	// header — the server is TCP-only and shouldn't advertise h3.
+	altSvc string
 }
 
 // tDay0 is T=0 as UTC: 2025-11-01 00:00 CEST = 2025-10-31 23:00 UTC.
@@ -34,6 +41,40 @@ func currentTDay() int { return int(time.Now().UTC().Sub(tDay0).Hours() / 24) }
 
 func NewServer(rt *kernel.Runtime, registry *operad.Registry, _ int) *Server {
 	return &Server{rt: rt, inspect: rt, write: rt, observe: rt, registry: registry}
+}
+
+// SetAltSvc records the Alt-Svc header value to advertise on every response.
+// Call from main.go after the QUIC listener is started, passing the actual
+// configured UDP address. An empty string disables the header.
+//
+// This is not concurrency-safe post-startup: call it once before Handler()
+// is attached to an http.Server, or before the first request is served.
+func (s *Server) SetAltSvc(v string) { s.altSvc = v }
+
+// corsMiddleware adds CORS headers to every response and handles OPTIONS
+// preflight. The Alt-Svc header is only emitted when s.altSvc is non-empty
+// (set by SetAltSvc once the QUIC listener's actual port is known), so
+// we never advertise an HTTP/3 endpoint that doesn't exist.
+//
+// SECURITY NOTE (PR #8 review): Allow-Origin: * is intentional for local
+// dev / LAN deployments where any browser page needs to reach the kernel
+// during exploration. For production deployments that expose the kernel
+// beyond the host, wrap with a stricter CORS policy or set up an
+// authenticating reverse proxy.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if s.altSvc != "" {
+			w.Header().Set("Alt-Svc", s.altSvc)
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) Handler() http.Handler {
@@ -49,6 +90,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /log", s.handleGetLog)
 	mux.HandleFunc("GET /log/stream", s.handleLogStream)
+
+	mux.HandleFunc("GET /fold", s.handleGetFold)
+	mux.HandleFunc("GET /fold/stream", s.handleFoldStream)
 
 	mux.HandleFunc("POST /rewrites", s.handlePostRewrite)
 	mux.HandleFunc("POST /programs", s.handlePostProgram)
@@ -71,7 +115,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /hdc/crosswalk/suggestions", s.handleGetHDCCrosswalkSuggestions)
 	mux.HandleFunc("GET /hdc/classification-space", s.handleGetHDCClassificationSpace)
 
-	return mux
+	// Twin-kernel endpoints (M9 — adjoint sync protocol)
+	mux.HandleFunc("POST /twin/ingest", s.handleTwinIngest)
+	mux.HandleFunc("GET /twin/status", s.handleTwinStatus)
+
+	return s.corsMiddleware(mux)
 }
 
 // --- Health ---
@@ -148,6 +196,122 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// --- Fold ---
+
+// handleGetFold returns the graph state projected at log position `to`.
+// GET /fold?to=<n>  — state at time n (replay log[0..n])
+// GET /fold         — current state (equivalent to full log replay)
+// This is the M3 catamorphism exposed as an HTTP observable.
+func (s *Server) handleGetFold(w http.ResponseWriter, r *http.Request) {
+	log := s.inspect.Log()
+
+	to := len(log)
+	if raw := strings.TrimSpace(r.URL.Query().Get("to")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			if v < 0 {
+				v = 0
+			}
+			if v > len(log) {
+				v = len(log)
+			}
+			to = v
+		}
+	}
+
+	state, err := fold.Replay(log[:to])
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "fold: "+err.Error())
+		return
+	}
+
+	nodes := make([]graph.Node, 0, len(state.Nodes))
+	for _, n := range state.Nodes {
+		nodes = append(nodes, n)
+	}
+	rels := make([]graph.Relation, 0, len(state.Relations))
+	for _, rel := range state.Relations {
+		rels = append(rels, rel)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"t":         to,
+		"log_len":   len(log),
+		"nodes":     nodes,
+		"relations": rels,
+	})
+}
+
+// handleFoldStream streams state evolution via SSE with proper event types.
+//
+// On connect: emits one `event: snapshot` carrying the full state at time T.
+// Thereafter: emits one `event: rewrite` per newly-applied rewrite.
+//
+// Clients can reconstruct state(t+k) = fold(snapshot + rewrites[0..k]).
+// Browser EventSource dispatches to named listeners: `es.addEventListener("snapshot", ...)`
+// and `es.addEventListener("rewrite", ...)`. The wire format now uses SSE
+// `event:` framing rather than an embedded JSON field so standard EventSource
+// clients work out of the box (PR #8 review, Copilot).
+func (s *Server) handleFoldStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Subscribe first so we don't miss rewrites between snapshot and stream start.
+	id := fmt.Sprintf("fold-sse-%d", time.Now().UnixNano())
+	ch := s.observe.Subscribe(id)
+	defer s.observe.Unsubscribe(id)
+
+	// Send current state snapshot as the initial "snapshot" event.
+	log := s.inspect.Log()
+	if state, err := fold.Replay(log); err == nil {
+		nodes := make([]graph.Node, 0, len(state.Nodes))
+		for _, n := range state.Nodes {
+			nodes = append(nodes, n)
+		}
+		rels := make([]graph.Relation, 0, len(state.Relations))
+		for _, rel := range state.Relations {
+			rels = append(rels, rel)
+		}
+		snap := map[string]any{
+			"t":         len(log),
+			"nodes":     nodes,
+			"relations": rels,
+		}
+		if data, err := json.Marshal(snap); err == nil {
+			fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+
+	// Stream subsequent rewrites as "rewrite" events.
+	for {
+		select {
+		case pr, open := <-ch:
+			if !open {
+				return
+			}
+			evt := map[string]any{
+				"log_seq": pr.LogSeq,
+				"rewrite": pr,
+			}
+			data, err := json.Marshal(evt)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: rewrite\ndata: %s\n\n", data)
 			flusher.Flush()
 		case <-r.Context().Done():
 			return

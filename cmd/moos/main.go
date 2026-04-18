@@ -36,8 +36,10 @@ func main() {
 	seedUser := flag.String("seed-user", "sam", "username for seed node")
 	seedWS := flag.String("seed-ws", "hp-laptop", "workstation name for seed node")
 	quicAddr := flag.String("quic-addr", "", "UDP address for HTTP/3 QUIC listener (e.g. :4433). Requires --tls-cert and --tls-key.")
-	tlsCert  := flag.String("tls-cert", "", "Path to TLS certificate file (PEM) for QUIC listener")
-	tlsKey   := flag.String("tls-key",  "", "Path to TLS private key file (PEM) for QUIC listener")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate file (PEM) for QUIC listener")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key file (PEM) for QUIC listener")
+	sweepInterval := flag.Duration("sweep-interval", 30*time.Second,
+		"t_hook sweep tick interval (0 disables; default 30s). Each tick evaluates all pending t_hooks and emits a governance_proposal per firing.")
 	flag.Parse()
 
 	// --- Load registry ---
@@ -144,6 +146,18 @@ func main() {
 		tSrv.SetAltSvc(fmt.Sprintf(`h3=%q; ma=2592000`, *quicAddr))
 		go tSrv.ServeQUIC(*quicAddr, *tlsCert, *tlsKey)
 	}
+
+	// --- Start time-driven t_hook sweep (§M14 hook-predicates, round-9 M2) ---
+	// Every --sweep-interval, walk pending t_hooks and ADD a governance_proposal
+	// per hook whose predicate fires. Proposals sit at status=pending awaiting
+	// admin ratification. --sweep-interval=0 disables.
+	//
+	// The sweep actor URN defaults to urn:moos:kernel:sweep; when seeding is
+	// enabled we override to the specific kernel URN for traceability.
+	if *doSeed {
+		rt.SetSweepActor(graph.URN(fmt.Sprintf("urn:moos:kernel:%s.primary", *seedWS)))
+	}
+	go rt.RunTimedSweep(ctx, *sweepInterval)
 
 	// --- Graceful shutdown ---
 	quit := make(chan os.Signal, 1)

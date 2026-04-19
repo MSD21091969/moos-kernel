@@ -144,3 +144,38 @@ func TestIndexRemoveRelationEndpoints_CleansEmptySets(t *testing.T) {
 		t.Errorf("RelationsByTgt should not retain empty bucket for urn:b")
 	}
 }
+
+// TestClone_PreservesNilIndexesAsNil — Clone MUST return nil indexes when
+// the source state has nil indexes. Otherwise the accessor fallback
+// (NodesOfType etc.) can't distinguish "index not initialized (fall back
+// to scan)" from "index initialized but empty (trust the index)", and
+// cloning an un-indexed state would silently break hand-crafted test
+// fixtures. Regression for PR #24 review (Gemini HIGH).
+func TestClone_PreservesNilIndexesAsNil(t *testing.T) {
+	s := GraphState{
+		Nodes: map[URN]Node{
+			"urn:a": {URN: "urn:a", TypeID: "program"},
+		},
+		Relations: map[URN]Relation{
+			"r1": {URN: "r1", SrcURN: "urn:a", TgtURN: "urn:a"},
+		},
+		// All three indexes intentionally nil.
+	}
+
+	c := s.Clone()
+	if c.NodesByType != nil {
+		t.Errorf("Clone must preserve nil NodesByType; got initialized map %v", c.NodesByType)
+	}
+	if c.RelationsBySrc != nil {
+		t.Errorf("Clone must preserve nil RelationsBySrc; got initialized map %v", c.RelationsBySrc)
+	}
+	if c.RelationsByTgt != nil {
+		t.Errorf("Clone must preserve nil RelationsByTgt; got initialized map %v", c.RelationsByTgt)
+	}
+
+	// And the fallback still works on the clone.
+	got := c.NodesOfType("program")
+	if len(got) != 1 || got[0] != "urn:a" {
+		t.Errorf("NodesOfType fallback broken on clone of nil-indexed state: %v", got)
+	}
+}

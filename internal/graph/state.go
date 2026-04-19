@@ -35,11 +35,16 @@ type GraphState struct {
 // NewGraphState returns a zero state with all maps (including the indexes)
 // initialized. Callers should prefer this over the zero-value struct so
 // that the indexes are ready before the first ADD/LINK.
+//
+// NodesByType is sized with a small initial capacity (64) — the distinct
+// TypeID count is bounded by the ontology, typically 50-ish, so larger
+// hints over-allocate significantly. Relation endpoint maps start at 0
+// and grow as LINKs land.
 func NewGraphState() GraphState {
 	return GraphState{
 		Nodes:          make(map[URN]Node),
 		Relations:      make(map[URN]Relation),
-		NodesByType:    make(map[TypeID]map[URN]struct{}),
+		NodesByType:    make(map[TypeID]map[URN]struct{}, 64),
 		RelationsBySrc: make(map[URN]map[URN]struct{}),
 		RelationsByTgt: make(map[URN]map[URN]struct{}),
 	}
@@ -52,8 +57,13 @@ func NewGraphState() GraphState {
 //
 // Cost: O(len(Nodes) + len(Relations)). Typically called once at
 // kernel start (fold.Replay) and never again.
+//
+// NodesByType is sized with a small initial capacity — the number of
+// distinct TypeIDs in practice is on the order of 50 even for large
+// graphs. A capacity hint proportional to len(Nodes) would over-allocate
+// by ~100x (PR #24 review — Gemini).
 func (s *GraphState) Rebuild() {
-	s.NodesByType = make(map[TypeID]map[URN]struct{}, len(s.Nodes))
+	s.NodesByType = make(map[TypeID]map[URN]struct{}, 64)
 	for urn, n := range s.Nodes {
 		IndexAddNodeByType(s.NodesByType, urn, n.TypeID)
 	}
@@ -70,6 +80,14 @@ func (s *GraphState) Rebuild() {
 // Clones Nodes and Relations deeply; the secondary indexes are deep-copied
 // too (shallow reuse would let fold mutations on the clone leak into the
 // caller's map, breaking the "state-on-failure is unchanged" guarantee).
+//
+// TODO(perf): Clone is called on every Apply and ApplyProgram step, and
+// the deep-copy of the indexes is O(total-entries). For large graphs this
+// is the dominant cost of an apply. A copy-on-write scheme (pointer to
+// parent maps, copy on first mutation) would amortize this to O(mutations)
+// at the cost of more complex index bookkeeping. Flagged by PR #24 review
+// (Gemini); left as-is for now because correctness takes precedence and
+// the current cost is predictable.
 func (s GraphState) Clone() GraphState {
 	c := GraphState{
 		Nodes:          make(map[URN]Node, len(s.Nodes)),
@@ -253,9 +271,16 @@ func IndexRemoveRelationEndpoints(bySrc, byTgt map[URN]map[URN]struct{}, relURN,
 }
 
 // cloneURNSetMap deep-copies a map[TypeID]map[URN]struct{}.
+//
+// IMPORTANT: returns nil when src is nil. This preserves the
+// nil-vs-initialized semantic that NodesOfType / RelationsFrom /
+// RelationsTo rely on — an auto-initialized empty map would make the
+// accessors think the index exists and bypass the scan fallback,
+// silently returning empty on hand-crafted test states (PR #24 review —
+// Gemini HIGH).
 func cloneURNSetMap(src map[TypeID]map[URN]struct{}) map[TypeID]map[URN]struct{} {
 	if src == nil {
-		return make(map[TypeID]map[URN]struct{})
+		return nil
 	}
 	out := make(map[TypeID]map[URN]struct{}, len(src))
 	for k, set := range src {
@@ -269,9 +294,12 @@ func cloneURNSetMap(src map[TypeID]map[URN]struct{}) map[TypeID]map[URN]struct{}
 }
 
 // cloneURNURNSet deep-copies a map[URN]map[URN]struct{}.
+//
+// IMPORTANT: returns nil when src is nil, for the same reason as
+// cloneURNSetMap above (PR #24 review — Gemini HIGH).
 func cloneURNURNSet(src map[URN]map[URN]struct{}) map[URN]map[URN]struct{} {
 	if src == nil {
-		return make(map[URN]map[URN]struct{})
+		return nil
 	}
 	out := make(map[URN]map[URN]struct{}, len(src))
 	for k, set := range src {

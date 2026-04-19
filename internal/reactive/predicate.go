@@ -189,9 +189,12 @@ func evaluateMapWithContext(p map[string]any, state *graph.GraphState, currentT 
 		if !ok || sessionNode.TypeID != "session" {
 			return false
 		}
+		// Walk only the relations outbound from the session (O(edges-at-
+		// session) on indexed state; falls back to scan otherwise).
 		var occupant graph.URN
-		for _, rel := range state.Relations {
-			if rel.SrcURN != ctx.SessionURN {
+		for _, relURN := range state.RelationsFrom(ctx.SessionURN) {
+			rel, ok := state.Relations[relURN]
+			if !ok {
 				continue
 			}
 			if rel.SrcPort != "has-occupant" || rel.TgtPort != "is-occupant-of" {
@@ -210,7 +213,12 @@ func evaluateMapWithContext(p map[string]any, state *graph.GraphState, currentT 
 		if _, ok := state.Nodes[target]; !ok {
 			return false
 		}
-		for _, rel := range state.Relations {
+		// Walk only relations outbound from the occupant.
+		for _, relURN := range state.RelationsFrom(occupant) {
+			rel, ok := state.Relations[relURN]
+			if !ok {
+				continue
+			}
 			if rel.SrcURN == occupant && rel.SrcPort == "governs" && rel.TgtURN == target {
 				return true
 			}

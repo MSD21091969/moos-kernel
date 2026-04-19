@@ -75,17 +75,15 @@ const DefaultSweepActor graph.URN = "urn:moos:kernel:sweep"
 // the sequence matches the log_seq that ApplyProgram will assign when
 // the envelopes actually append (PR #12 review — Gemini).
 func SweepOnce(state graph.GraphState, currentT int, actor graph.URN, baseLogSeq int64, now time.Time) []graph.Envelope {
-	// Build the idempotency set: hooks that already have a proposal.
-	// Single O(nodes) pass before the main loop.
-	//
-	// TODO(perf): this is O(nodes) per tick. A guarded-node index
-	// maintained during ADD/UNLINK would reduce to O(proposals); the
-	// same index can subsume the t_hook walk below (PR #12 review —
-	// Gemini, Copilot).
+	// Build the idempotency set via the by-type accessor: only
+	// governance_proposal nodes need to be visited. O(proposals) on
+	// production states (indexed); O(all-nodes) fallback on un-indexed
+	// test fixtures.
 	proposedHooks := make(map[graph.URN]struct{})
-	for _, n := range state.Nodes {
-		if n.TypeID != "governance_proposal" {
-			continue
+	for _, propURN := range state.NodesOfType("governance_proposal") {
+		n, ok := state.Nodes[propURN]
+		if !ok {
+			continue // index drift (should not happen); skip
 		}
 		p, ok := n.Properties["source_t_hook_urn"]
 		if !ok {
@@ -101,8 +99,10 @@ func SweepOnce(state graph.GraphState, currentT int, actor graph.URN, baseLogSeq
 	emitted := int64(0)
 	nowStr := now.UTC().Format(time.RFC3339)
 
-	for _, n := range state.Nodes {
-		if n.TypeID != "t_hook" {
+	// Walk only the t_hook bucket rather than every node in the graph.
+	for _, hookURN := range state.NodesOfType("t_hook") {
+		n, ok := state.Nodes[hookURN]
+		if !ok {
 			continue
 		}
 		// Idempotency check: already proposed this hook → skip.

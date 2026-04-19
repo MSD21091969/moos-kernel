@@ -51,6 +51,10 @@ func applyADD(state graph.GraphState, env graph.Envelope) (graph.GraphState, gra
 		CreatedAt:  time.Now().UTC(),
 		Version:    1,
 	}
+	// Maintain the NodesByType index so sweep/t-cone can look up nodes by
+	// TypeID in O(bucket-size) instead of O(all-nodes). The helper tolerates
+	// a nil map (older states created without NewGraphState).
+	graph.IndexAddNodeByType(next.NodesByType, env.NodeURN, env.TypeID)
 	return next, graph.EvalResult{AffectedNodeURN: env.NodeURN}, nil
 }
 
@@ -79,6 +83,10 @@ func applyLINK(state graph.GraphState, env graph.Envelope) (graph.GraphState, gr
 		ContractURN:     env.ContractURN,
 		CreatedAt:       time.Now().UTC(),
 	}
+	// Maintain the by-endpoint relation indexes so occupancy walks and
+	// t-cone neighbourhood queries run in O(edges-at-urn) instead of
+	// O(all-relations).
+	graph.IndexAddRelationEndpoints(next.RelationsBySrc, next.RelationsByTgt, env.RelationURN, env.SrcURN, env.TgtURN)
 	return next, graph.EvalResult{AffectedRelationURN: env.RelationURN}, nil
 }
 
@@ -132,11 +140,15 @@ func applyMUTATE(state graph.GraphState, env graph.Envelope) (graph.GraphState, 
 }
 
 func applyUNLINK(state graph.GraphState, env graph.Envelope) (graph.GraphState, graph.EvalResult, error) {
-	if _, exists := state.Relations[env.RelationURN]; !exists {
+	existing, exists := state.Relations[env.RelationURN]
+	if !exists {
 		return state, graph.EvalResult{}, fmt.Errorf("%w: %s", ErrRelationNotFound, env.RelationURN)
 	}
 	next := state.Clone()
 	delete(next.Relations, env.RelationURN)
+	// Remove the relation from both endpoint indexes so subsequent walks
+	// don't see a stale URN.
+	graph.IndexRemoveRelationEndpoints(next.RelationsBySrc, next.RelationsByTgt, env.RelationURN, existing.SrcURN, existing.TgtURN)
 	return next, graph.EvalResult{AffectedRelationURN: env.RelationURN}, nil
 }
 

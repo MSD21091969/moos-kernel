@@ -14,6 +14,7 @@ import (
 	"moos/kernel/internal/hdc"
 	"moos/kernel/internal/kernel"
 	"moos/kernel/internal/operad"
+	"moos/kernel/internal/tday"
 )
 
 // Server is the HTTP adapter layer. Transport is NOT part of the graph.
@@ -34,10 +35,10 @@ type Server struct {
 	altSvc string
 }
 
-// tDay0 is T=0 as UTC: 2025-11-01 00:00 CEST = 2025-10-31 23:00 UTC.
-var tDay0 = time.Date(2025, 10, 31, 23, 0, 0, 0, time.UTC)
-
-func currentTDay() int { return int(time.Now().UTC().Sub(tDay0).Hours() / 24) }
+// currentTDay is a thin alias over tday.Now so handlers that already
+// imported the transport package can read T-day without pulling tday
+// directly. New code should call tday.Now.
+func currentTDay() int { return tday.Now() }
 
 func NewServer(rt *kernel.Runtime, registry *operad.Registry, _ int) *Server {
 	return &Server{rt: rt, inspect: rt, write: rt, observe: rt, registry: registry}

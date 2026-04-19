@@ -74,9 +74,12 @@ func ResolveSessionOccupant(state graph.GraphState, sessionURN graph.URN) (graph
 		return "", false
 	}
 
-	for _, rel := range state.Relations {
-		if rel.SrcURN != sessionURN {
-			continue
+	// Walk only the relations outbound from this session (O(edges-at-session),
+	// typically 1-3) rather than scanning every relation in the graph.
+	for _, relURN := range state.RelationsFrom(sessionURN) {
+		rel, ok := state.Relations[relURN]
+		if !ok {
+			continue // index drift; skip
 		}
 		// Match on BOTH sides of the WF19 port pair to avoid false positives
 		// from any future WF that reuses one of the port names.
@@ -155,10 +158,13 @@ func CheckAdminCapability(state graph.GraphState, actor graph.URN) bool {
 		return false
 	}
 
-	// Strict WF02 match: rewrite_category + src/tgt ports + target URN.
-	for _, rel := range state.Relations {
-		if rel.SrcURN != principal {
-			continue
+	// Walk only relations outbound from the principal (typically a
+	// handful of WF02 governance links) instead of the entire relation
+	// map. Strict WF02 match: rewrite_category + src/tgt ports + target URN.
+	for _, relURN := range state.RelationsFrom(principal) {
+		rel, ok := state.Relations[relURN]
+		if !ok {
+			continue // index drift; skip
 		}
 		if rel.RewriteCategory != graph.WF02 {
 			continue

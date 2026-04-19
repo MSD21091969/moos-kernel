@@ -145,8 +145,11 @@ func (s *Server) handleGetTCone(w http.ResponseWriter, r *http.Request) {
 		predicate     any
 	}
 	cone := make(map[graph.URN][]firing)
-	for _, n := range state.Nodes {
-		if n.TypeID != "t_hook" {
+	// Walk only the t_hook bucket via the by-type accessor. Production
+	// states use the index; hand-built test states fall back to a scan.
+	for _, hookURN := range state.NodesOfType("t_hook") {
+		n, ok := state.Nodes[hookURN]
+		if !ok {
 			continue
 		}
 		predProp, hasPred := n.Properties["predicate"]

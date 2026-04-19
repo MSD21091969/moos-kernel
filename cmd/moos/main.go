@@ -16,14 +16,9 @@ import (
 	"moos/kernel/internal/kernel"
 	"moos/kernel/internal/mcp"
 	"moos/kernel/internal/operad"
+	"moos/kernel/internal/tday"
 	"moos/kernel/internal/transport"
 )
-
-// tDay computes current T-day: days since T=0 (2025-11-01 00:00 CEST = 2025-10-31 23:00 UTC).
-func tDay() int {
-	t0 := time.Date(2025, 10, 31, 23, 0, 0, 0, time.UTC)
-	return int(time.Now().UTC().Sub(t0).Hours() / 24)
-}
 
 func main() {
 	ontologyPath := flag.String("ontology", "", "path to ontology.json (ffs0/kb/superset/ontology.json)")
@@ -95,7 +90,7 @@ func main() {
 	}
 
 	// --- Start HTTP transport ---
-	tSrv := transport.NewServer(rt, registry, tDay())
+	tSrv := transport.NewServer(rt, registry, tday.Now())
 	httpSrv := &http.Server{
 		Addr:    *listenAddr,
 		Handler: tSrv.Handler(),

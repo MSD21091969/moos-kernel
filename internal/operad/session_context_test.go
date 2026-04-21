@@ -391,11 +391,12 @@ func TestAdminScopeRewrite_MUTATEOwnerAuthorityField_NotAdminScope(t *testing.T)
 	}
 }
 
-func TestAdminScopeRewrite_MUTATEKernelAuthorityFieldOnKernelNode_NotAdminScope(t *testing.T) {
-	// Case: the authority_scope=kernel rule explicitly excludes kernel nodes
-	// themselves. The kernel is allowed to mutate its own properties via
-	// standard operad authority checks; PR 4's §M12 case 2 is for non-kernel
-	// nodes whose properties the ontology declared kernel-authority.
+func TestAdminScopeRewrite_MUTATEOnKernelNode_AdminScopeViaOntologyGovernedType(t *testing.T) {
+	// MUTATE on a kernel-typed node is admin-scope via case 1 (kernel is in
+	// ontology-governed types). Test documents this explicitly so reading
+	// the suite clarifies that kernel-nodes-are-always-admin-scope follows
+	// from the ontology-governed-type rule, not from the kernel-authority-
+	// field rule (which explicitly excludes kernel-typed targets).
 	reg := adminScopeRegistry()
 	state := graph.GraphState{
 		Nodes: map[graph.URN]graph.Node{
@@ -413,13 +414,63 @@ func TestAdminScopeRewrite_MUTATEKernelAuthorityFieldOnKernelNode_NotAdminScope(
 		TargetURN:   "urn:moos:kernel:hp-z440.primary",
 		Field:       "status",
 	}
-	// Note: because the target node IS type=kernel (ontology-governed),
-	// this envelope IS admin-scope via case 1. The test documents that
-	// the kernel-authority-field-on-kernel-node combination is admin-scope
-	// via the ontology-governed-type rule, NOT via the kernel-authority-
-	// field rule, so the exclusion in case 2 is well-defined.
 	if !reg.AdminScopeRewrite(env, state) {
 		t.Errorf("MUTATE on kernel-typed node should be admin-scope via ontology-governed-type rule")
+	}
+}
+
+// TestAdminScopeRewrite_MUTATETargetMissing_FailsClosed pins the Gemini
+// security-HIGH fix: a MUTATE whose target is absent from the passed state
+// is classified admin-scope (fail-closed). A lone missing-target MUTATE
+// will fold-fail with ErrNodeNotFound regardless; the real purpose is to
+// prevent an ADD-then-MUTATE batch from bypassing §M12 when the classifier
+// is called against the batch-initial state. ApplyProgram threads
+// workingState through the §M12 check so normal ADD+MUTATE batches DO see
+// the just-created node and classify correctly — this test pins the
+// behavior when the caller does NOT thread working-state.
+func TestAdminScopeRewrite_MUTATETargetMissing_FailsClosed(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:program:not-in-state",
+		Field:       "status",
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("MUTATE on missing target must fail closed (admin-scope=true) to prevent ADD+MUTATE bypass")
+	}
+}
+
+// TestAdminScopeRewrite_EmptyStoredAuthorityScope_FallsBackToTypeSpec pins
+// the Gemini security-HIGH fix on authorityScopeForField: when a node's
+// stored property has an empty AuthorityScope (e.g. an older ADD that
+// omitted the metadata), the classifier falls back to the registry type
+// spec rather than trusting the blank stored value. This prevents an ADD
+// that skipped authority_scope from indefinitely bypassing §M12 on its
+// kernel-authority properties.
+func TestAdminScopeRewrite_EmptyStoredAuthorityScope_FallsBackToTypeSpec(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:program:legacy": {
+				URN: "urn:moos:program:legacy", TypeID: "program",
+				Properties: map[string]graph.Property{
+					// Property present but AuthorityScope blank — simulates
+					// an ADD that didn't populate the metadata correctly.
+					"target_t": {Value: 100.0, Mutability: "mutable", AuthorityScope: ""},
+				},
+			},
+		},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:program:legacy",
+		Field:       "target_t", // type spec declares authority_scope=kernel
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("empty stored AuthorityScope should fall back to type spec (target_t is kernel-authority)")
 	}
 }
 

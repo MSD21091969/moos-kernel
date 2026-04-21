@@ -228,11 +228,19 @@ func isInfrastructureType(t graph.TypeID) bool {
 	return false
 }
 
-// ontologyGovernedTypes is the set of node types whose ADD or MUTATE
-// requires superadmin capability (§M12 Q3 case 2 per ffs0#33 Guido answers).
-// Any change to these types influences how the graph itself is grammared —
-// they are S2 infrastructure artifacts whose authority must route through
-// WF02 governs → role:superadmin, not ordinary occupant authority.
+// ontologyGovernedTypes is the set of node types whose ADD or MUTATE is
+// classified as admin-scope by §M12 (Guido answers on ffs0#33). When the
+// §M12 gate runs, envelopes touching these types require superadmin
+// capability via WF02 governs → role:superadmin.
+//
+// IMPORTANT on precedence: the §M11 allowlist (SystemInternalEnvelope)
+// runs BEFORE §M12 in the kernel gate. Kernel-URN actors + ADD of
+// infrastructure types (user, workstation, kernel) bypass §M11 entirely
+// and therefore never reach §M12. So an ADD of type=kernel by a kernel-
+// actor or during bootstrap does NOT require superadmin — it's
+// allowlisted up the pipeline. §M12's admin-scope rule applies only to
+// envelopes that reach the admin check, which excludes system-internal
+// and bootstrap paths.
 //
 //   - system_instruction: S4 context overlay, shapes how downstream
 //     reads interpret the graph.
@@ -243,6 +251,8 @@ func isInfrastructureType(t graph.TypeID) bool {
 //     breaks federation.
 //   - kernel: ADD kernel creates a new sovereign substrate — as
 //     ontology-adjacent as it gets (Guido flag on the M11/M12 plan).
+//     Allowlisted for kernel-actor and infrastructure-bootstrap paths
+//     per the precedence note above.
 var ontologyGovernedTypes = map[graph.TypeID]struct{}{
 	"system_instruction":  {},
 	"gate":                {},
@@ -293,10 +303,21 @@ func (r *Registry) AdminScopeRewrite(env graph.Envelope, state graph.GraphState)
 	if env.RewriteType == graph.MUTATE {
 		node, ok := state.Nodes[env.TargetURN]
 		if !ok {
-			// Target missing from state — fold will reject with ErrNodeNotFound
-			// at apply time. Not our problem to enforce admin-scope on a
-			// non-existent node.
-			return false
+			// Target missing from the state passed here. Fail closed:
+			// classify as admin-scope. Rationale (Gemini security flag on
+			// PR 31):
+			//   - A lone MUTATE on a non-existent node will fold-fail with
+			//     ErrNodeNotFound regardless; marking it admin-scope does
+			//     no harm (the admin-cap check runs and then fold rejects).
+			//   - Inside a program batch where an ADD creates the target
+			//     first and a later MUTATE touches it, callers must pass
+			//     the working-state (post-ADD) to AdminScopeRewrite. If
+			//     they pass pre-batch state here, the classifier does not
+			//     have enough context to rule on authority_scope and
+			//     must not silently pass. Kernel.Runtime.ApplyProgram
+			//     threads workingState through the per-envelope §M12
+			//     check for exactly this reason (T=171 PR 31 fix).
+			return true
 		}
 
 		// Case 1 — target node is of an ontology-governed type.
@@ -304,12 +325,16 @@ func (r *Registry) AdminScopeRewrite(env graph.Envelope, state graph.GraphState)
 			return true
 		}
 
-		// Case 2 — kernel-authority property MUTATE on a non-kernel node.
-		// Check existing node properties first (cheap map lookup), then fall
-		// back to the registry type spec for additive MUTATE (field not yet
-		// present on the node).
+		// Case 2 — kernel-authority property MUTATE. node.TypeID == "kernel"
+		// is already handled by case 1 (kernel is ontology-governed), so no
+		// extra exclusion is needed here. Check existing node properties
+		// first (cheap map lookup); fall back to the registry type spec
+		// for additive MUTATE (field not yet present on the node) AND for
+		// cases where the stored property's AuthorityScope is empty (an
+		// ADD that omitted the authority metadata — fail-closed, trust the
+		// registry declaration, Gemini security flag on PR 31).
 		if scope, ok := authorityScopeForField(r, node, env.Field); ok {
-			if scope == "kernel" && node.TypeID != "kernel" {
+			if scope == "kernel" {
 				return true
 			}
 		}
@@ -322,13 +347,22 @@ func (r *Registry) AdminScopeRewrite(env graph.Envelope, state graph.GraphState)
 	return false
 }
 
-// authorityScopeForField returns the AuthorityScope for a field on a node,
-// preferring the live property record (reflects what actually landed) and
-// falling back to the type-spec declaration (for additive MUTATEs where
-// the field is not yet on the node). Returns "", false when the field is
-// unknown to both sources.
+// authorityScopeForField returns the AuthorityScope for a field on a node.
+// Prefers the live property record when it carries a non-empty scope
+// (reflects what actually landed); falls back to the registry type-spec
+// declaration for both additive MUTATE (field not yet on the node) AND
+// the case where the stored property has an empty AuthorityScope (e.g.
+// an older ADD that omitted the metadata).
+//
+// The empty-scope-falls-through pattern closes the Gemini security flag
+// on PR 31: trusting whatever's in state could let an ADD that forgot to
+// populate AuthorityScope bypass §M12 indefinitely. The registry
+// declaration is authoritative and should always be consulted when the
+// stored value is missing or blank.
+//
+// Returns "", false when the field is unknown to both sources.
 func authorityScopeForField(r *Registry, node graph.Node, field string) (string, bool) {
-	if prop, ok := node.Properties[field]; ok {
+	if prop, ok := node.Properties[field]; ok && prop.AuthorityScope != "" {
 		return prop.AuthorityScope, true
 	}
 	typeSpec, hasType := r.NodeTypes[node.TypeID]

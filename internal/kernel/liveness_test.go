@@ -677,6 +677,95 @@ func TestSeedIfAbsent_M12_OntologyGovernedADD_BypassesBoth(t *testing.T) {
 	}
 }
 
+// TestApplyProgram_M12_IntraBatchADDThenKernelAuthorityMUTATE_Rejected
+// pins the Gemini security-HIGH fix on PR 31: a batch that ADDs a new
+// program node and in the same batch MUTATEs a kernel-authority property
+// on it previously bypassed §M12 because the preflight checker saw the
+// target missing from the batch-initial state and classified as
+// not-admin-scope. Post-fix, §M12 runs against the working state inside
+// the write-locked loop; by envelope 2, the program node exists and its
+// kernel-authority field is correctly classified admin-scope.
+func TestApplyProgram_M12_IntraBatchADDThenKernelAuthorityMUTATE_Rejected(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	) // claude occupies a session, passes §M11, no superadmin
+
+	preLen := rt.LogLen()
+
+	program := []graph.Envelope{
+		{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:agent:claude",
+			NodeURN:     "urn:moos:program:freshly-baked",
+			TypeID:      "program",
+		},
+		{
+			RewriteType: graph.MUTATE,
+			Actor:       "urn:moos:agent:claude",
+			TargetURN:   "urn:moos:program:freshly-baked", // created in envelope 1
+			Field:       "target_t",                        // authority_scope=kernel per type spec
+			NewValue:    200.0,
+		},
+	}
+	_, err := rt.ApplyProgram(program)
+	if err == nil {
+		t.Fatalf("ADD+kernel-authority-MUTATE batch without superadmin must be rejected")
+	}
+	if !strings.Contains(err.Error(), "§M12") {
+		t.Errorf("error should cite §M12; got %q", err.Error())
+	}
+	if got := rt.LogLen(); got != preLen {
+		t.Errorf("atomic rejection should leave log unchanged; pre=%d post=%d", preLen, got)
+	}
+}
+
+// TestApplyProgram_M12_IntraBatchADDThenOwnerMUTATE_Passes confirms the
+// fix does not over-reject: a batch that ADDs a program and then
+// MUTATEs an owner-authority field on it (e.g. status) still passes §M12
+// because the mid-batch classification correctly sees the target as a
+// program (not ontology-governed) and the field as owner-authority.
+func TestApplyProgram_M12_IntraBatchADDThenOwnerMUTATE_Passes(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	)
+	// Register WF18 so ValidateMUTATE is happy.
+	rt.registry.RewriteCategories[graph.WF18] = operad.RewriteCategorySpec{
+		ID:              graph.WF18,
+		AllowedRewrites: []graph.RewriteType{graph.ADD, graph.MUTATE, graph.LINK},
+		MutateScope:     []string{"status"},
+	}
+
+	program := []graph.Envelope{
+		{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:agent:claude",
+			NodeURN:     "urn:moos:program:ordinary",
+			TypeID:      "program",
+			Properties: map[string]graph.Property{
+				"status":    {Value: "active", Mutability: "mutable", AuthorityScope: "owner"},
+				"owner_urn": {Value: "urn:moos:agent:claude", Mutability: "immutable"},
+			},
+		},
+		{
+			RewriteType:     graph.MUTATE,
+			Actor:           "urn:moos:agent:claude",
+			TargetURN:       "urn:moos:program:ordinary",
+			Field:           "status", // owner-authority
+			NewValue:        "checkpoint",
+			RewriteCategory: graph.WF18,
+		},
+	}
+	if _, err := rt.ApplyProgram(program); err != nil {
+		t.Fatalf("owner-authority MUTATE on same-batch-ADDed program must pass §M12; got %v", err)
+	}
+}
+
 // Test 8 — fold.Replay of pre-PR-4 rewrites that would now be admin-scope
 // still replays cleanly. fold doesn't call checkLiveness, so §M12 has no
 // retroactive effect. Mirrors the prospective-only invariant for §M11

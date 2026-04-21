@@ -453,6 +453,362 @@ func TestApply_M11_OccupiedSessionAsActor_Accepted(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------------------------
+// §M12 admin-capability gate — PR 4 integration tests
+// ------------------------------------------------------------------
+
+// adminLivenessRegistry extends the liveness-test registry with property
+// specs the §M12 classifier consults (owner vs kernel authority_scope).
+func adminLivenessRegistry() *operad.Registry {
+	reg := livenessTestRegistry()
+	reg.NodeTypes["program"] = operad.NodeTypeSpec{
+		ID: "program", Stratum: "S2",
+		Properties: map[string]operad.PropertySpec{
+			"status":   {Mutability: "mutable", AuthorityScope: "owner"},
+			"target_t": {Mutability: "mutable", AuthorityScope: "kernel"},
+		},
+	}
+	// Ontology-governed types need declarations so ValidateADD doesn't reject
+	// them as "unknown type_id" before §M12 runs.
+	for _, t := range []graph.TypeID{"system_instruction", "gate", "twin_link", "transport_binding", "role"} {
+		reg.NodeTypes[t] = operad.NodeTypeSpec{ID: t, Stratum: "S2"}
+	}
+	return reg
+}
+
+// injectSuperadminRole wires a role:superadmin node into state plus a
+// WF02 governs LINK from principal → role. Mirrors the §M12 admin chain
+// from operad.CheckAdminCapability.
+func injectSuperadminRole(rt *Runtime, principal graph.URN) {
+	const superadmin graph.URN = "urn:moos:role:superadmin"
+	rt.state.Nodes[superadmin] = graph.Node{URN: superadmin, TypeID: "role"}
+
+	relURN := graph.URN("urn:moos:rel:" + string(principal) + ".governs.superadmin")
+	rt.state.Relations[relURN] = graph.Relation{
+		URN: relURN, RewriteCategory: graph.WF02,
+		SrcURN: principal, SrcPort: "governs",
+		TgtURN: superadmin, TgtPort: "governed-by",
+	}
+	if rt.state.RelationsBySrc[principal] == nil {
+		rt.state.RelationsBySrc[principal] = map[graph.URN]struct{}{}
+	}
+	rt.state.RelationsBySrc[principal][relURN] = struct{}{}
+	if rt.state.RelationsByTgt[superadmin] == nil {
+		rt.state.RelationsByTgt[superadmin] = map[graph.URN]struct{}{}
+	}
+	rt.state.RelationsByTgt[superadmin][relURN] = struct{}{}
+}
+
+func newAdminRuntime(t *testing.T) *Runtime {
+	t.Helper()
+	return &Runtime{
+		state:       graph.NewGraphState(),
+		store:       NewMemStore(),
+		registry:    adminLivenessRegistry(),
+		subscribers: make(map[string]chan graph.PersistedRewrite),
+	}
+}
+
+// Test 1 — Guido's list: non-admin actor + ontology-governed ADD is rejected.
+func TestApply_M12_NonAdminActor_OntologyGovernedADD_Rejected(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	) // §M11 passes; §M12 is the gate under test
+
+	env := graph.Envelope{
+		RewriteType: graph.ADD,
+		Actor:       "urn:moos:agent:claude", // no superadmin
+		NodeURN:     "urn:moos:gate:bad",
+		TypeID:      "gate", // ontology-governed
+	}
+	_, err := rt.Apply(env)
+	if err == nil {
+		t.Fatalf("ontology-governed ADD without superadmin should be rejected")
+	}
+	if !strings.Contains(err.Error(), "§M12") {
+		t.Errorf("error should cite §M12; got %q", err.Error())
+	}
+}
+
+// Test 2 — admin actor + ontology-governed ADD is accepted.
+func TestApply_M12_AdminActor_OntologyGovernedADD_Accepted(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	)
+	injectSuperadminRole(rt, "urn:moos:agent:claude")
+
+	env := graph.Envelope{
+		RewriteType: graph.ADD,
+		Actor:       "urn:moos:agent:claude",
+		NodeURN:     "urn:moos:system_instruction:persona.test",
+		TypeID:      "system_instruction",
+	}
+	if _, err := rt.Apply(env); err != nil {
+		t.Fatalf("admin actor should pass §M12; got %v", err)
+	}
+}
+
+// Test 3 — ordinary type ADD passes §M12 even for non-admin actor.
+func TestApply_M12_NonAdminActor_OrdinaryADD_NotAdminScope(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	)
+
+	env := graph.Envelope{
+		RewriteType: graph.ADD,
+		Actor:       "urn:moos:agent:claude",
+		NodeURN:     "urn:moos:program:ordinary",
+		TypeID:      "program", // not ontology-governed
+	}
+	if _, err := rt.Apply(env); err != nil {
+		t.Fatalf("ordinary-type ADD should not trigger §M12; got %v", err)
+	}
+}
+
+// Test 4 — non-admin actor MUTATEing a kernel-authority field on a
+// non-kernel node is rejected with §M12.
+func TestApply_M12_NonAdminActor_KernelAuthorityMUTATE_Rejected(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	)
+	// Pre-seed a program node with target_t (kernel-authority).
+	rt.state.Nodes["urn:moos:program:p"] = graph.Node{
+		URN: "urn:moos:program:p", TypeID: "program",
+		Properties: map[string]graph.Property{
+			"target_t": {Value: 190.0, Mutability: "mutable", AuthorityScope: "kernel"},
+		},
+	}
+
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:agent:claude", // non-kernel, non-superadmin
+		TargetURN:   "urn:moos:program:p",
+		Field:       "target_t",
+		NewValue:    200.0,
+	}
+	_, err := rt.Apply(env)
+	if err == nil {
+		t.Fatalf("kernel-authority MUTATE by non-admin non-kernel actor should be rejected")
+	}
+	if !strings.Contains(err.Error(), "§M12") {
+		t.Errorf("error should cite §M12; got %q", err.Error())
+	}
+}
+
+// Test 5 — owner-authority MUTATE is not admin-scope, passes.
+func TestApply_M12_NonAdminActor_OwnerAuthorityMUTATE_NotAdminScope(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	)
+	rt.state.Nodes["urn:moos:program:p"] = graph.Node{
+		URN: "urn:moos:program:p", TypeID: "program",
+		Properties: map[string]graph.Property{
+			"status":    {Value: "active", Mutability: "mutable", AuthorityScope: "owner"},
+			"owner_urn": {Value: "urn:moos:agent:claude", Mutability: "immutable"},
+		},
+	}
+
+	env := graph.Envelope{
+		RewriteType:     graph.MUTATE,
+		Actor:           "urn:moos:agent:claude",
+		TargetURN:       "urn:moos:program:p",
+		Field:           "status",
+		NewValue:        "checkpoint",
+		RewriteCategory: graph.WF18,
+	}
+	// Register WF18 so ValidateMUTATE's standard-path check doesn't trip
+	// on "unknown rewrite_category". Minimal spec is fine — the §M12 test
+	// doesn't exercise mutate_scope semantics.
+	rt.registry.RewriteCategories[graph.WF18] = operad.RewriteCategorySpec{
+		ID:              graph.WF18,
+		AllowedRewrites: []graph.RewriteType{graph.MUTATE, graph.LINK, graph.ADD},
+		MutateScope:     []string{"status"},
+	}
+
+	if _, err := rt.Apply(env); err != nil {
+		t.Fatalf("owner-authority MUTATE should pass §M12; got %v", err)
+	}
+}
+
+// Test 6 — kernel-URN actor bypasses §M12 via §M11 allowlist (precedence).
+func TestApply_M12_KernelActor_OntologyGovernedADD_AllowlistBeforeM12(t *testing.T) {
+	rt := newAdminRuntime(t)
+	// No sessions, no superadmin role. Kernel actor bypasses §M11 entirely
+	// via SystemInternalEnvelope, and that bypass precedes the §M12 check
+	// so admin-scope never runs for kernel actors.
+	env := graph.Envelope{
+		RewriteType: graph.ADD,
+		Actor:       "urn:moos:kernel:hp-z440.primary",
+		NodeURN:     "urn:moos:gate:internal",
+		TypeID:      "gate",
+	}
+	if _, err := rt.Apply(env); err != nil {
+		t.Fatalf("kernel-actor ontology-governed ADD should be allowlisted before §M12; got %v", err)
+	}
+}
+
+// Test 7 — SeedIfAbsent bypass passes both §M11 and §M12.
+func TestSeedIfAbsent_M12_OntologyGovernedADD_BypassesBoth(t *testing.T) {
+	rt := newAdminRuntime(t)
+	// No occupancy, no superadmin — seed should still land via skipLiveness.
+	env := graph.Envelope{
+		RewriteType: graph.ADD,
+		Actor:       "urn:moos:user:sam",
+		NodeURN:     "urn:moos:transport_binding:bootstrap",
+		TypeID:      "transport_binding",
+	}
+	if err := rt.SeedIfAbsent(env); err != nil {
+		t.Fatalf("SeedIfAbsent should bypass §M12; got %v", err)
+	}
+}
+
+// TestApplyProgram_M12_IntraBatchADDThenKernelAuthorityMUTATE_Rejected
+// pins the Gemini security-HIGH fix on PR 31: a batch that ADDs a new
+// program node and in the same batch MUTATEs a kernel-authority property
+// on it previously bypassed §M12 because the preflight checker saw the
+// target missing from the batch-initial state and classified as
+// not-admin-scope. Post-fix, §M12 runs against the working state inside
+// the write-locked loop; by envelope 2, the program node exists and its
+// kernel-authority field is correctly classified admin-scope.
+func TestApplyProgram_M12_IntraBatchADDThenKernelAuthorityMUTATE_Rejected(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	) // claude occupies a session, passes §M11, no superadmin
+
+	preLen := rt.LogLen()
+
+	program := []graph.Envelope{
+		{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:agent:claude",
+			NodeURN:     "urn:moos:program:freshly-baked",
+			TypeID:      "program",
+		},
+		{
+			RewriteType: graph.MUTATE,
+			Actor:       "urn:moos:agent:claude",
+			TargetURN:   "urn:moos:program:freshly-baked", // created in envelope 1
+			Field:       "target_t",                        // authority_scope=kernel per type spec
+			NewValue:    200.0,
+		},
+	}
+	_, err := rt.ApplyProgram(program)
+	if err == nil {
+		t.Fatalf("ADD+kernel-authority-MUTATE batch without superadmin must be rejected")
+	}
+	if !strings.Contains(err.Error(), "§M12") {
+		t.Errorf("error should cite §M12; got %q", err.Error())
+	}
+	if got := rt.LogLen(); got != preLen {
+		t.Errorf("atomic rejection should leave log unchanged; pre=%d post=%d", preLen, got)
+	}
+}
+
+// TestApplyProgram_M12_IntraBatchADDThenOwnerMUTATE_Passes confirms the
+// fix does not over-reject: a batch that ADDs a program and then
+// MUTATEs an owner-authority field on it (e.g. status) still passes §M12
+// because the mid-batch classification correctly sees the target as a
+// program (not ontology-governed) and the field as owner-authority.
+func TestApplyProgram_M12_IntraBatchADDThenOwnerMUTATE_Passes(t *testing.T) {
+	rt := newAdminRuntime(t)
+	injectOccupancy(rt,
+		"urn:moos:session:sam.a",
+		"urn:moos:agent:claude",
+		"agent",
+	)
+	// Register WF18 so ValidateMUTATE is happy.
+	rt.registry.RewriteCategories[graph.WF18] = operad.RewriteCategorySpec{
+		ID:              graph.WF18,
+		AllowedRewrites: []graph.RewriteType{graph.ADD, graph.MUTATE, graph.LINK},
+		MutateScope:     []string{"status"},
+	}
+
+	program := []graph.Envelope{
+		{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:agent:claude",
+			NodeURN:     "urn:moos:program:ordinary",
+			TypeID:      "program",
+			Properties: map[string]graph.Property{
+				"status":    {Value: "active", Mutability: "mutable", AuthorityScope: "owner"},
+				"owner_urn": {Value: "urn:moos:agent:claude", Mutability: "immutable"},
+			},
+		},
+		{
+			RewriteType:     graph.MUTATE,
+			Actor:           "urn:moos:agent:claude",
+			TargetURN:       "urn:moos:program:ordinary",
+			Field:           "status", // owner-authority
+			NewValue:        "checkpoint",
+			RewriteCategory: graph.WF18,
+		},
+	}
+	if _, err := rt.ApplyProgram(program); err != nil {
+		t.Fatalf("owner-authority MUTATE on same-batch-ADDed program must pass §M12; got %v", err)
+	}
+}
+
+// Test 8 — fold.Replay of pre-PR-4 rewrites that would now be admin-scope
+// still replays cleanly. fold doesn't call checkLiveness, so §M12 has no
+// retroactive effect. Mirrors the prospective-only invariant for §M11
+// and the port-pair validator from PR 1.
+func TestReplay_M12_PreservesPrePR4AdminScopeRewrites(t *testing.T) {
+	log := []graph.PersistedRewrite{
+		{
+			LogSeq: 1,
+			Envelope: graph.Envelope{
+				RewriteType: graph.ADD,
+				Actor:       "urn:moos:user:sam", // non-admin
+				NodeURN:     "urn:moos:gate:pre-pr4",
+				TypeID:      "gate",
+				Properties: map[string]graph.Property{
+					"predicate_expr": {Value: "true", Mutability: "immutable"},
+				},
+			},
+		},
+		{
+			LogSeq: 2,
+			Envelope: graph.Envelope{
+				RewriteType: graph.ADD,
+				Actor:       "urn:moos:user:sam",
+				NodeURN:     "urn:moos:system_instruction:pre-pr4",
+				TypeID:      "system_instruction",
+				Properties: map[string]graph.Property{
+					"content": {Value: "legacy", Mutability: "mutable"},
+				},
+			},
+		},
+	}
+	state, err := fold.Replay(log)
+	if err != nil {
+		t.Fatalf("replay of pre-PR-4 admin-scope rewrites should succeed; got %v", err)
+	}
+	if _, ok := state.Nodes["urn:moos:gate:pre-pr4"]; !ok {
+		t.Errorf("replayed state missing gate:pre-pr4")
+	}
+	if _, ok := state.Nodes["urn:moos:system_instruction:pre-pr4"]; !ok {
+		t.Errorf("replayed state missing system_instruction:pre-pr4")
+	}
+}
+
 // TestApply_RegistryLess_LivenessNoop — when the Runtime has no registry
 // loaded (--ontology omitted), the liveness gate is a no-op. Preserves the
 // existing "registry-less mode" UX and matches the pattern used by the

@@ -235,22 +235,271 @@ func TestSystemInternalEnvelope_UserLINKNotAllowlisted(t *testing.T) {
 }
 
 // ------------------------------------------------------------------
-// AdminScopeRewrite — PR 3 plumbing, dormant (always returns false)
+// AdminScopeRewrite — §M12 classifier (PR 4)
 // ------------------------------------------------------------------
 
-func TestAdminScopeRewrite_DormantInPR3(t *testing.T) {
-	// Until PR 4 fills in the classifier, no envelope is admin-scope-gated.
-	// This test pins the dormant state so PR 4 is explicitly a behavior
-	// change rather than a silent flip.
-	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
-	samples := []graph.Envelope{
-		{RewriteType: graph.ADD, Actor: "urn:moos:user:sam", TypeID: "system_instruction"},
-		{RewriteType: graph.MUTATE, Actor: "urn:moos:user:sam", TargetURN: "urn:moos:program:x", Field: "status"},
-		{RewriteType: graph.LINK, Actor: "urn:moos:user:sam", RewriteCategory: graph.WF01},
+// adminScopeRegistry returns a Registry with the node-type specs PR 4
+// exercises: `program` (ordinary, owner-authority), `session` (kernel-
+// authority on context_urn + local_t), and the five ontology-governed
+// types whose touches are always admin-scope.
+func adminScopeRegistry() *Registry {
+	reg := EmptyRegistry()
+	reg.NodeTypes["program"] = NodeTypeSpec{
+		ID: "program", Stratum: "S2",
+		Properties: map[string]PropertySpec{
+			"status":    {Mutability: "mutable", AuthorityScope: "owner"},
+			"target_t":  {Mutability: "mutable", AuthorityScope: "kernel"},
+			"scope":     {Mutability: "mutable", AuthorityScope: "owner"},
+			"owner_urn": {Mutability: "immutable", AuthorityScope: ""},
+		},
 	}
-	for _, env := range samples {
-		if AdminScopeRewrite(env, state) {
-			t.Errorf("AdminScopeRewrite should be dormant in PR 3; got true for %+v", env)
+	reg.NodeTypes["session"] = NodeTypeSpec{
+		ID: "session", Stratum: "S2",
+		Properties: map[string]PropertySpec{
+			"context_urn": {Mutability: "mutable", AuthorityScope: "kernel"},
+			"local_t":     {Mutability: "mutable", AuthorityScope: "kernel"},
+			"view_prefs":  {Mutability: "mutable", AuthorityScope: "owner"},
+		},
+	}
+	for _, t := range []graph.TypeID{"system_instruction", "gate", "twin_link", "transport_binding", "kernel"} {
+		reg.NodeTypes[t] = NodeTypeSpec{ID: t, Stratum: "S2"}
+	}
+	return reg
+}
+
+func TestAdminScopeRewrite_ADDOntologyGoverned_AllTypes(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
+	for _, typeID := range []graph.TypeID{"system_instruction", "gate", "twin_link", "transport_binding", "kernel"} {
+		env := graph.Envelope{
+			RewriteType: graph.ADD,
+			Actor:       "urn:moos:user:sam",
+			TypeID:      typeID,
+			NodeURN:     graph.URN("urn:moos:" + string(typeID) + ":test"),
 		}
+		if !reg.AdminScopeRewrite(env, state) {
+			t.Errorf("ADD of ontology-governed type %s should be admin-scope", typeID)
+		}
+	}
+}
+
+func TestAdminScopeRewrite_ADDOrdinaryType_NotAdminScope(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
+	env := graph.Envelope{
+		RewriteType: graph.ADD,
+		Actor:       "urn:moos:user:sam",
+		TypeID:      "program",
+		NodeURN:     "urn:moos:program:x",
+	}
+	if reg.AdminScopeRewrite(env, state) {
+		t.Errorf("ADD of ordinary type (program) should NOT be admin-scope")
+	}
+}
+
+func TestAdminScopeRewrite_MUTATEOntologyGovernedNode_AdminScope(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:gate:approval": {URN: "urn:moos:gate:approval", TypeID: "gate"},
+		},
+		Relations: map[graph.URN]graph.Relation{},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:gate:approval",
+		Field:       "predicate_expr",
+		NewValue:    "true",
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("MUTATE of gate node (ontology-governed) should be admin-scope")
+	}
+}
+
+func TestAdminScopeRewrite_MUTATEKernelAuthorityField_AdminScope(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:program:x": {
+				URN: "urn:moos:program:x", TypeID: "program",
+				Properties: map[string]graph.Property{
+					"target_t": {Value: 190.0, Mutability: "mutable", AuthorityScope: "kernel"},
+				},
+			},
+		},
+		Relations: map[graph.URN]graph.Relation{},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam", // non-kernel actor
+		TargetURN:   "urn:moos:program:x",
+		Field:       "target_t", // authority_scope=kernel
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("MUTATE of kernel-authority field on non-kernel node should be admin-scope")
+	}
+}
+
+// TestAdminScopeRewrite_MUTATEKernelAuthorityField_AdditiveLookup exercises the
+// registry-type-spec fallback path for an additive MUTATE: the field is not
+// yet on the node, so the classifier consults the type spec's AuthorityScope
+// declaration directly.
+func TestAdminScopeRewrite_MUTATEKernelAuthorityField_AdditiveLookup(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:program:y": {
+				URN: "urn:moos:program:y", TypeID: "program",
+				Properties: map[string]graph.Property{}, // target_t not yet on node
+			},
+		},
+		Relations: map[graph.URN]graph.Relation{},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:program:y",
+		Field:       "target_t", // kernel-authority in type spec
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("additive MUTATE of kernel-authority field should be admin-scope via type-spec lookup")
+	}
+}
+
+func TestAdminScopeRewrite_MUTATEOwnerAuthorityField_NotAdminScope(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:program:x": {
+				URN: "urn:moos:program:x", TypeID: "program",
+				Properties: map[string]graph.Property{
+					"status": {Value: "active", Mutability: "mutable", AuthorityScope: "owner"},
+				},
+			},
+		},
+		Relations: map[graph.URN]graph.Relation{},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:program:x",
+		Field:       "status", // authority_scope=owner
+	}
+	if reg.AdminScopeRewrite(env, state) {
+		t.Errorf("MUTATE of owner-authority field should NOT be admin-scope")
+	}
+}
+
+func TestAdminScopeRewrite_MUTATEOnKernelNode_AdminScopeViaOntologyGovernedType(t *testing.T) {
+	// MUTATE on a kernel-typed node is admin-scope via case 1 (kernel is in
+	// ontology-governed types). Test documents this explicitly so reading
+	// the suite clarifies that kernel-nodes-are-always-admin-scope follows
+	// from the ontology-governed-type rule, not from the kernel-authority-
+	// field rule (which explicitly excludes kernel-typed targets).
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:kernel:hp-z440.primary": {
+				URN: "urn:moos:kernel:hp-z440.primary", TypeID: "kernel",
+				Properties: map[string]graph.Property{
+					"status": {Value: "active", Mutability: "mutable", AuthorityScope: "kernel"},
+				},
+			},
+		},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:kernel:hp-z440.primary",
+		Field:       "status",
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("MUTATE on kernel-typed node should be admin-scope via ontology-governed-type rule")
+	}
+}
+
+// TestAdminScopeRewrite_MUTATETargetMissing_FailsClosed pins the Gemini
+// security-HIGH fix: a MUTATE whose target is absent from the passed state
+// is classified admin-scope (fail-closed). A lone missing-target MUTATE
+// will fold-fail with ErrNodeNotFound regardless; the real purpose is to
+// prevent an ADD-then-MUTATE batch from bypassing §M12 when the classifier
+// is called against the batch-initial state. ApplyProgram threads
+// workingState through the §M12 check so normal ADD+MUTATE batches DO see
+// the just-created node and classify correctly — this test pins the
+// behavior when the caller does NOT thread working-state.
+func TestAdminScopeRewrite_MUTATETargetMissing_FailsClosed(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:program:not-in-state",
+		Field:       "status",
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("MUTATE on missing target must fail closed (admin-scope=true) to prevent ADD+MUTATE bypass")
+	}
+}
+
+// TestAdminScopeRewrite_EmptyStoredAuthorityScope_FallsBackToTypeSpec pins
+// the Gemini security-HIGH fix on authorityScopeForField: when a node's
+// stored property has an empty AuthorityScope (e.g. an older ADD that
+// omitted the metadata), the classifier falls back to the registry type
+// spec rather than trusting the blank stored value. This prevents an ADD
+// that skipped authority_scope from indefinitely bypassing §M12 on its
+// kernel-authority properties.
+func TestAdminScopeRewrite_EmptyStoredAuthorityScope_FallsBackToTypeSpec(t *testing.T) {
+	reg := adminScopeRegistry()
+	state := graph.GraphState{
+		Nodes: map[graph.URN]graph.Node{
+			"urn:moos:program:legacy": {
+				URN: "urn:moos:program:legacy", TypeID: "program",
+				Properties: map[string]graph.Property{
+					// Property present but AuthorityScope blank — simulates
+					// an ADD that didn't populate the metadata correctly.
+					"target_t": {Value: 100.0, Mutability: "mutable", AuthorityScope: ""},
+				},
+			},
+		},
+	}
+	env := graph.Envelope{
+		RewriteType: graph.MUTATE,
+		Actor:       "urn:moos:user:sam",
+		TargetURN:   "urn:moos:program:legacy",
+		Field:       "target_t", // type spec declares authority_scope=kernel
+	}
+	if !reg.AdminScopeRewrite(env, state) {
+		t.Errorf("empty stored AuthorityScope should fall back to type spec (target_t is kernel-authority)")
+	}
+}
+
+func TestAdminScopeRewrite_LINK_NotAdminScope(t *testing.T) {
+	// LINK / UNLINK are not admin-scope in §M12 v1. The doctrine gates on
+	// node-level operations; relation-level admin-gating would be a v2
+	// extension with its own doctrine note.
+	reg := adminScopeRegistry()
+	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
+	env := graph.Envelope{
+		RewriteType:     graph.LINK,
+		Actor:           "urn:moos:user:sam",
+		RelationURN:     "urn:moos:rel:test",
+		SrcURN:          "urn:moos:session:sam.a",
+		TgtURN:          "urn:moos:gate:approval", // ontology-governed tgt
+		RewriteCategory: graph.WF19,
+	}
+	if reg.AdminScopeRewrite(env, state) {
+		t.Errorf("LINK should not be admin-scope in §M12 v1")
+	}
+}
+
+func TestAdminScopeRewrite_NilRegistry(t *testing.T) {
+	// Nil-receiver safety: matches the pattern used elsewhere (ValidateLINK,
+	// ValidateMUTATE, checkLiveness all short-circuit on nil registry).
+	var r *Registry
+	state := graph.GraphState{Nodes: map[graph.URN]graph.Node{}, Relations: map[graph.URN]graph.Relation{}}
+	env := graph.Envelope{RewriteType: graph.ADD, TypeID: "gate"}
+	if r.AdminScopeRewrite(env, state) {
+		t.Errorf("nil registry should return false")
 	}
 }

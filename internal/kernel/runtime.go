@@ -184,16 +184,15 @@ func (rt *Runtime) applyWithOptions(env graph.Envelope, opts applyOptions) (grap
 // §M11 liveness is checked per-envelope before structural validation so a
 // single session-less envelope fails the whole batch fast.
 func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult, error) {
-	// Preflight under read-lock: §M11 liveness checks read rt.state maps,
-	// so we must hold the read-lock for the entire batch preflight. Held
-	// across all envelopes so liveness observations are consistent with
-	// each other. Release before acquiring the write-lock below (RWMutex
-	// does not support upgrade). Same apply-time guarantee as Apply:
-	// fold.EvaluateProgram under the write-lock is the authoritative
-	// check; preflight rejects early on clearly-bad batches.
+	// Preflight under read-lock: §M11 (emitter-context) checks read rt.state
+	// maps, so we hold the read-lock across the entire batch preflight. §M11
+	// is evaluated against the batch-initial state — emitter references
+	// cannot depend on prior envelopes in the batch (see impl-plan §2.4).
+	// §M12 is NOT checked here; it runs per-envelope inside the write-locked
+	// working-state loop below so target-classification sees mid-batch ADDs.
 	rt.mu.RLock()
 	for _, env := range envelopes {
-		if err := rt.checkLiveness(env); err != nil {
+		if err := rt.checkLivenessM11(env, rt.state); err != nil {
 			rt.mu.RUnlock()
 			return nil, err
 		}
@@ -228,6 +227,17 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 			}
 		}
 		injected[i] = env
+
+		// §M12 admin-scope gate against working state. Per-envelope so a
+		// MUTATE on a node ADDed in an earlier envelope of this batch sees
+		// the node's type when classifying. Closes the PR 31 Gemini
+		// security-HIGH where initial-state preflight let a batch ADD a
+		// target and then MUTATE its kernel-authority property without
+		// triggering the admin check. §M11 preflight already ran above;
+		// if we reach here the emitter-context check has passed.
+		if err := rt.checkLivenessM12(env, workingState); err != nil {
+			return nil, err
+		}
 
 		// Strata enforcement (M5) + Gate check (M8) against the working state.
 		if env.RewriteType == graph.LINK && rt.registry != nil {

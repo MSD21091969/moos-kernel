@@ -27,6 +27,17 @@ func (r *Registry) ValidateADD(env graph.Envelope) error {
 }
 
 // ValidateLINK checks port, type, and color constraints on a LINK envelope.
+//
+// Port-pair validation (T=171 round 11 PR 1): the (src_port, tgt_port) pair
+// must match either the WF's primary (SrcPort, TgtPort) or one of its declared
+// AdditionalPortPairs. Pairs declared only on the AdditionalPortPairs list of
+// ontology.json (e.g. WF19 has-occupant/is-occupant-of, pins-urn/pinned-by-session)
+// are now validated — previously they slipped through when the loader didn't
+// consume the field. Prospective only: replay of pre-PR-1 logs via fold runs
+// without re-validation, so historical non-canonical relations (e.g. an LINK
+// recorded at v3.11 with a typo'd tgt_port) persist in state. Correction of
+// such relations is via new compensating UNLINK+re-LINK rewrites, not via
+// retroactive validator action.
 func (r *Registry) ValidateLINK(env graph.Envelope) error {
 	wfSpec, ok := r.RewriteCategories[env.RewriteCategory]
 	if !ok {
@@ -38,23 +49,28 @@ func (r *Registry) ValidateLINK(env graph.Envelope) error {
 		return fmt.Errorf("operad: rewrite_category %s does not allow LINK", env.RewriteCategory)
 	}
 
-	// Validate src type
-	srcNode, ok := r.NodeTypes[graph.TypeID("")] // filled below
-	_ = srcNode
-	// We validate src and tgt types are in the WF's declared lists
-	// (actual TypeID comes from the graph state at apply time — operad checks structural rules here)
-	_ = wfSpec.SrcTypes
-	_ = wfSpec.TgtTypes
-
 	// WF15 contract requirement is checked in fold — but double-check here as well
 	if env.RewriteCategory == graph.WF15 && env.ContractURN == "" {
 		return fmt.Errorf("operad: WF15 LINK requires contract_urn")
 	}
 
-	// Port color compatibility
+	// Port pair must match one of the WF's declared pairs (primary or additional).
+	// Only enforced when the WF actually declares a primary pair; empty means the
+	// WF is a degenerate or spec-absent category — keep the old permissive
+	// behavior in that case.
+	if wfSpec.SrcPort != "" || wfSpec.TgtPort != "" || len(wfSpec.AdditionalPortPairs) > 0 {
+		if !linkPairDeclared(wfSpec, env.SrcPort, env.TgtPort) {
+			return fmt.Errorf("operad: port pair (%s, %s) not declared for %s; expected %s",
+				env.SrcPort, env.TgtPort, env.RewriteCategory,
+				describeDeclaredPairs(wfSpec))
+		}
+	}
+
+	// Port color compatibility (§12.2). Unknown colors remain permissive so
+	// registry gaps don't hard-block rewrites; strict pair validation above
+	// already catches typo'd ports.
 	srcColor, tgtColor, err := r.resolvePortColors(env.SrcPort, env.TgtPort)
 	if err != nil {
-		// Unknown port — warn but allow if registry is partial
 		return nil
 	}
 	if !r.PortColorMatrix.Allowed(srcColor, tgtColor, env.RewriteCategory) {
@@ -62,6 +78,40 @@ func (r *Registry) ValidateLINK(env graph.Envelope) error {
 			srcColor, tgtColor, env.RewriteCategory)
 	}
 	return nil
+}
+
+// linkPairDeclared reports whether (src, tgt) matches the WF's primary pair or
+// any of its additional_port_pairs.
+func linkPairDeclared(wfSpec RewriteCategorySpec, src, tgt string) bool {
+	if wfSpec.SrcPort == src && wfSpec.TgtPort == tgt {
+		return true
+	}
+	for _, p := range wfSpec.AdditionalPortPairs {
+		if p.SrcPort == src && p.TgtPort == tgt {
+			return true
+		}
+	}
+	return false
+}
+
+// describeDeclaredPairs renders the WF's accepted port pairs for error messages.
+// Primary pair first, additional pairs in declaration order.
+func describeDeclaredPairs(wfSpec RewriteCategorySpec) string {
+	pairs := make([]string, 0, 1+len(wfSpec.AdditionalPortPairs))
+	if wfSpec.SrcPort != "" || wfSpec.TgtPort != "" {
+		pairs = append(pairs, fmt.Sprintf("(%s, %s)", wfSpec.SrcPort, wfSpec.TgtPort))
+	}
+	for _, p := range wfSpec.AdditionalPortPairs {
+		pairs = append(pairs, fmt.Sprintf("(%s, %s)", p.SrcPort, p.TgtPort))
+	}
+	if len(pairs) == 0 {
+		return "(none declared)"
+	}
+	out := pairs[0]
+	for _, p := range pairs[1:] {
+		out += " | " + p
+	}
+	return out
 }
 
 // ValidateMUTATE checks mutability, WF scope, and authority constraints on a MUTATE envelope.
@@ -175,7 +225,10 @@ func portColorFromName(port string) graph.PortColor {
 	case "participates", "participated-by", "focus", "on",
 		"anchors", "anchor", "causes", "summarizes", "daily-summary", "depends-on", "depended-by", "participant",
 		"triggers", "triggered-by", "guards", "guarded-by", "emits", "emitted-by", "watches", "watched-by",
-		"has-occupant", "is-occupant-of": // v3.10 WF19 session-occupancy port pair (§M19)
+		"has-occupant", "is-occupant-of", // v3.10 WF19 session-occupancy port pair (§M19)
+		"pins-urn", "pinned-by-session", // v3.12 WF19 session pins (§M18, D19.3)
+		"filtered-by", "filters-session", // v3.12 WF19 session filter binding (§M18, D19.4)
+		"mounts-tool", "tool-mounted-in-session": // v3.12 WF19 session tool mount (§M20, D20.1)
 		return graph.ColorWorkflow
 	case "projected-to", "rendered-as", "displayed-as":
 		return graph.ColorProjection

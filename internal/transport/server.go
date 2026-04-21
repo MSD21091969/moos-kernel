@@ -133,10 +133,15 @@ func (s *Server) Handler() http.Handler {
 // --- Health ---
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ontologyVersion := ""
+	if s.registry != nil {
+		ontologyVersion = s.registry.Version
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"log_len": s.inspect.LogLen(),
-		"t_day":   currentTDay(),
+		"status":           "ok",
+		"log_len":          s.inspect.LogLen(),
+		"t_day":            currentTDay(),
+		"ontology_version": ontologyVersion,
 	})
 }
 

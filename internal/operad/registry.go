@@ -7,9 +7,15 @@ import "moos/kernel/internal/graph"
 // It governs what rewrites are valid: which node types exist,
 // which rewrite categories are allowed, what port colors are compatible.
 type Registry struct {
-	NodeTypes        map[graph.TypeID]NodeTypeSpec
+	// Version is the ontology version string (e.g. "3.12.0") parsed from the
+	// top-level "version" field of ontology.json. Empty when the registry is
+	// built via EmptyRegistry (no ontology loaded). Exposed read-only via
+	// /healthz so that state-readback tooling can detect runtime vs. on-disk
+	// ontology drift without grepping feature flags.
+	Version           string
+	NodeTypes         map[graph.TypeID]NodeTypeSpec
 	RewriteCategories map[graph.RewriteCategory]RewriteCategorySpec
-	PortColorMatrix  PortColorMatrix
+	PortColorMatrix   PortColorMatrix
 }
 
 // NodeTypeSpec describes the valid structure of one node type.

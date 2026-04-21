@@ -8,9 +8,11 @@ import (
 	"moos/kernel/internal/graph"
 )
 
-// LoadRegistry parses ontology.json (v3.6, codex-aligned format) and
-// builds a Registry. The ontology path should point to
-// ffs0/kb/superset/ontology.json or a copy of it.
+// LoadRegistry parses ontology.json and builds a Registry. The ontology
+// path should point to ffs0/kb/superset/ontology.json or a copy of it.
+// The parsed ontology version is captured on the returned Registry's
+// Version field; callers that care about schema pinning should read that
+// rather than assume a version here.
 //
 // If path is empty, returns an EmptyRegistry with a warning — the kernel
 // will run but without type validation.
@@ -30,6 +32,7 @@ func LoadRegistry(path string) (*Registry, error) {
 	}
 
 	reg := EmptyRegistry()
+	reg.Version = raw.Version
 
 	// Load node types from s2_infrastructure
 	for _, nt := range raw.Types.S2Infrastructure {
@@ -139,16 +142,17 @@ func parseColorMatrix(raw map[string]map[string]any) PortColorMatrix {
 	return m
 }
 
-// --- raw JSON shapes for ontology.json v3.6 ---
+// --- raw JSON shapes for ontology.json ---
 
 type ontologyJSON struct {
-	Types struct {
+	Version string `json:"version"`
+	Types   struct {
 		S2Infrastructure []rawNodeType `json:"s2_infrastructure"`
 		S1Grammar        []rawNodeType `json:"s1_grammar"`
 		InteractionNodes []rawNodeType `json:"interaction_nodes"`
 	} `json:"types"`
-	RewriteCategories      []rawRewriteCategory   `json:"rewrite_categories"`
-	PortColorCompatibility rawPortColorCompat     `json:"port_color_compatibility"`
+	RewriteCategories      []rawRewriteCategory `json:"rewrite_categories"`
+	PortColorCompatibility rawPortColorCompat   `json:"port_color_compatibility"`
 }
 
 type rawNodeType struct {

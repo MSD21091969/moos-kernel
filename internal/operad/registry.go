@@ -45,16 +45,36 @@ type PropertySpec struct {
 
 // RewriteCategorySpec declares the rules for one WF category.
 type RewriteCategorySpec struct {
-	ID              graph.RewriteCategory
-	Name            string
-	AllowedRewrites []graph.RewriteType
-	SrcTypes        []graph.TypeID
-	TgtTypes        []graph.TypeID
-	SrcPort         string
-	TgtPort         string
-	Authority       string
-	MutateScope     []string // exhaustive list of fields that may be changed under this WF
-	SyncMode        string   // "strict" | "eventual" | "local-only"
+	ID                   graph.RewriteCategory
+	Name                 string
+	AllowedRewrites      []graph.RewriteType
+	SrcTypes             []graph.TypeID
+	TgtTypes             []graph.TypeID
+	SrcPort              string
+	TgtPort              string
+	AdditionalPortPairs  []AdditionalPortPair // v3.10+ extension mechanism (§M19 has-occupant, §M18 pins-urn, etc.)
+	Authority            string
+	MutateScope          []string // exhaustive list of fields that may be changed under this WF
+	SyncMode             string   // "strict" | "eventual" | "local-only"
+}
+
+// AdditionalPortPair declares a secondary (src_port, tgt_port) pairing that a WF
+// category also accepts in addition to its primary (SrcPort, TgtPort). Introduced
+// by the v3.10 D19.1 grammar_fragment to carry WF19 has-occupant/is-occupant-of
+// topology without bumping to a new WF number, then extended by v3.12 (D19.3
+// pins-urn, D19.4 filtered-by, D20.1 mounts-tool) for §M18-§M20 workspace shape.
+//
+// Loader consumes these into the registry so ValidateLINK can accept any
+// declared pair for the WF. SrcTypes/TgtTypes, when non-empty, further restrict
+// the pair to specific node types — empty means the WF's top-level lists apply.
+type AdditionalPortPair struct {
+	SrcPort          string
+	TgtPort          string
+	SrcTypes         []graph.TypeID
+	TgtTypes         []graph.TypeID
+	AddedInVersion   string // e.g. "3.10.0"
+	PromotesFragment string // URN of the grammar_fragment this pair promotes from, if any
+	Description      string
 }
 
 // PortColorMatrix is the §12.2 compatibility matrix.

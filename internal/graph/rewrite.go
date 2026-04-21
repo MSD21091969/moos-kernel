@@ -20,13 +20,23 @@ const (
 //
 // Field usage by rewrite type:
 //
-//	ADD:    NodeURN, TypeID, Properties, Actor
-//	LINK:   RelationURN, SrcURN, SrcPort, TgtURN, TgtPort, RewriteCategory, ContractURN (WF15), Actor
-//	MUTATE: TargetURN, Field, NewValue, ExpectedVersion (0 = skip CAS), RewriteCategory, Actor
-//	UNLINK: RelationURN, Actor
+//	ADD:    NodeURN, TypeID, Properties, Actor, (SessionURN)
+//	LINK:   RelationURN, SrcURN, SrcPort, TgtURN, TgtPort, RewriteCategory, ContractURN (WF15), Actor, (SessionURN)
+//	MUTATE: TargetURN, Field, NewValue, ExpectedVersion (0 = skip CAS), RewriteCategory, Actor, (SessionURN)
+//	UNLINK: RelationURN, Actor, (SessionURN)
 type Envelope struct {
 	RewriteType RewriteType `json:"rewrite_type"`
 	Actor       URN         `json:"actor"` // URN of the node requesting this rewrite
+
+	// SessionURN optionally names the session this envelope runs under for
+	// §M11 liveness gating. When set, the kernel verifies that the session
+	// exists, is occupied, and that its has-occupant target matches Actor.
+	// When empty, the kernel reverse-looks-up from Actor via has-occupant:
+	// exactly one candidate passes; zero or multiple is ambiguous and the
+	// envelope is rejected. Clients with single-session actors can omit;
+	// clients where one actor drives multiple sessions MUST set this.
+	// §M11 doctrine: kb/research/kernel/20260417-t187-kernel-proper.md.
+	SessionURN URN `json:"session_urn,omitempty"`
 
 	// ADD fields
 	NodeURN    URN                 `json:"node_urn,omitempty"`
@@ -43,11 +53,11 @@ type Envelope struct {
 	ContractURN     URN             `json:"contract_urn,omitempty"` // required for WF15
 
 	// MUTATE fields
-	TargetURN       URN      `json:"target_urn,omitempty"`
-	Field           string   `json:"field,omitempty"`
-	NewValue        any      `json:"new_value,omitempty"`
-	ExpectedVersion int64    `json:"expected_version,omitempty"` // 0 = skip CAS
-	PropertySpec    *Property `json:"property_spec,omitempty"`   // injected for additive MUTATE (field not yet on node)
+	TargetURN       URN       `json:"target_urn,omitempty"`
+	Field           string    `json:"field,omitempty"`
+	NewValue        any       `json:"new_value,omitempty"`
+	ExpectedVersion int64     `json:"expected_version,omitempty"` // 0 = skip CAS
+	PropertySpec    *Property `json:"property_spec,omitempty"`    // injected for additive MUTATE (field not yet on node)
 }
 
 // EvalResult is the outcome of applying a single Envelope.

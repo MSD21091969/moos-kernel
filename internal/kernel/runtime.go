@@ -76,8 +76,46 @@ func NewRuntime(store Store, registry *operad.Registry) (*Runtime, error) {
 }
 
 // Apply validates and applies one Envelope atomically.
-// Order: operad validate → fold.Evaluate → lock → persist → broadcast.
+// Order: §M11 liveness gate → operad validate → fold.Evaluate → lock → persist → broadcast.
 func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
+	return rt.applyWithOptions(env, applyOptions{})
+}
+
+// applyOptions holds the fine-grained switches for rt.applyWithOptions. The
+// public Apply API hard-codes defaults; internal bootstrap paths (SeedIfAbsent,
+// reactive proposals) can tune behavior without widening the exported
+// surface.
+type applyOptions struct {
+	// skipLiveness bypasses the §M11 session-liveness check. Used exclusively
+	// by SeedIfAbsent during bootstrap: the first ADDs for user, workstation,
+	// and kernel nodes run before any session exists, so requiring occupancy
+	// would deadlock the bootstrap. See §M11 doctrine and
+	// kb/research/kernel/20260421-t171-m11-m12-implementation-plan.md §2.
+	skipLiveness bool
+}
+
+func (rt *Runtime) applyWithOptions(env graph.Envelope, opts applyOptions) (graph.EvalResult, error) {
+	// §M11 liveness gate. Before operad validation so a rewrite with no
+	// session context fails fast without paying the structural-validation
+	// cost. The check is registry-aware: registry-less mode passes through.
+	//
+	// checkLiveness reads rt.state maps, so we hold the read-lock for its
+	// duration. Release before the write-lock below to avoid lock upgrade
+	// (Go's sync.RWMutex does not support upgrade). There is a tiny window
+	// between RUnlock and Lock where another goroutine could advance
+	// state — that's fine: checkLiveness' output is an assertion about
+	// state at the time of observation, not a guarantee about the moment
+	// the rewrite actually lands. The fold.Evaluate under the write-lock
+	// is the authoritative apply-time check for structural invariants.
+	if !opts.skipLiveness {
+		rt.mu.RLock()
+		err := rt.checkLiveness(env)
+		rt.mu.RUnlock()
+		if err != nil {
+			return graph.EvalResult{}, err
+		}
+	}
+
 	// Operad validation (type system — read-lock not needed, registry is read-only)
 	if err := rt.validate(env); err != nil {
 		return graph.EvalResult{}, err
@@ -143,12 +181,28 @@ func (rt *Runtime) Apply(env graph.Envelope) (graph.EvalResult, error) {
 
 // ApplyProgram applies a slice of Envelopes atomically.
 // All or nothing: if any step fails, no state change and nothing is persisted.
+// §M11 liveness is checked per-envelope before structural validation so a
+// single session-less envelope fails the whole batch fast.
 func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult, error) {
+	// Preflight under read-lock: §M11 liveness checks read rt.state maps,
+	// so we must hold the read-lock for the entire batch preflight. Held
+	// across all envelopes so liveness observations are consistent with
+	// each other. Release before acquiring the write-lock below (RWMutex
+	// does not support upgrade). Same apply-time guarantee as Apply:
+	// fold.EvaluateProgram under the write-lock is the authoritative
+	// check; preflight rejects early on clearly-bad batches.
+	rt.mu.RLock()
 	for _, env := range envelopes {
+		if err := rt.checkLiveness(env); err != nil {
+			rt.mu.RUnlock()
+			return nil, err
+		}
 		if err := rt.validate(env); err != nil {
+			rt.mu.RUnlock()
 			return nil, err
 		}
 	}
+	rt.mu.RUnlock()
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -243,8 +297,14 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 
 // SeedIfAbsent is Apply that silently absorbs ErrNodeExists and ErrRelationExists.
 // Used for idempotent bootstrap seeding of infrastructure nodes.
+//
+// §M11 bypass: seed envelopes skip the liveness gate. Reason: bootstrap runs
+// before any session exists, so requiring has-occupant would deadlock the
+// first run. This is the only exception; operad.SystemInternalEnvelope
+// catches the post-bootstrap kernel-actor emissions that should also pass
+// the gate without bypass.
 func (rt *Runtime) SeedIfAbsent(env graph.Envelope) error {
-	_, err := rt.Apply(env)
+	_, err := rt.applyWithOptions(env, applyOptions{skipLiveness: true})
 	if err == nil {
 		return nil
 	}

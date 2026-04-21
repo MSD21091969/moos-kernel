@@ -59,9 +59,9 @@ func TestRotateSessionOccupant_OccupiedSession_EmitsUnlinkPlusLink(t *testing.T)
 	if link.SrcURN != "urn:moos:session:sam.hp-laptop" {
 		t.Errorf("link.SrcURN = %s, want session", link.SrcURN)
 	}
-	if link.SrcPort != "has-occupant" || link.TgtPort != "is-occupant-of" {
-		t.Errorf("link port pair = (%s, %s), want canonical (has-occupant, is-occupant-of)",
-			link.SrcPort, link.TgtPort)
+	if link.SrcPort != hasOccupantSrcPort || link.TgtPort != isOccupantOfTgtPort {
+		t.Errorf("link port pair = (%s, %s), want canonical (%s, %s)",
+			link.SrcPort, link.TgtPort, hasOccupantSrcPort, isOccupantOfTgtPort)
 	}
 	if link.TgtURN != "urn:moos:agent:claude-code.hp-z440" {
 		t.Errorf("link.TgtURN = %s, want new occupant", link.TgtURN)
@@ -156,7 +156,7 @@ func TestRotateSessionOccupant_SessionMissing(t *testing.T) {
 	}
 }
 
-func TestRotateSessionOccupant_TargetURNNotASession(t *testing.T) {
+func TestRotateSessionOccupant_SessionURNNotASession(t *testing.T) {
 	state := stateForRotation()
 	// Pass a user URN where a session URN is expected.
 	_, err := RotateSessionOccupant(
@@ -227,7 +227,55 @@ func TestRotateSessionOccupant_NewRelationURNCollidesWithPrior(t *testing.T) {
 		"actor",
 		"urn:moos:rel:sam.hp-laptop.has-occupant.user-sam", // same as prior
 	)
-	if err == nil || !strings.Contains(err.Error(), "collides") {
-		t.Fatalf("expected collision rejection; got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "already exists in state") {
+		t.Fatalf("expected collision rejection (already-exists message); got %v", err)
+	}
+}
+
+// TestRotateSessionOccupant_NewRelationURNCollidesWithUnrelatedRelation is the
+// tightening Gemini flagged: a newRelationURN that collides with ANY existing
+// relation — not just the prior has-occupant — must be rejected. Catches bugs
+// where a caller reuses a URN that happens to be taken by an unrelated LINK
+// (which would otherwise surface as ErrRelationExists at LINK apply time with
+// a less informative message).
+func TestRotateSessionOccupant_NewRelationURNCollidesWithUnrelatedRelation(t *testing.T) {
+	state := stateForRotation()
+	// Add an unrelated relation (not has-occupant on this session) whose URN
+	// the caller accidentally tries to reuse.
+	state.Relations["urn:moos:rel:unrelated.something"] = graph.Relation{
+		URN:             "urn:moos:rel:unrelated.something",
+		RewriteCategory: graph.WF02,
+		SrcURN:          "urn:moos:user:sam",
+		SrcPort:         "governs",
+		TgtURN:          "urn:moos:agent:claude-code.hp-z440",
+		TgtPort:         "governed-by",
+	}
+	_, err := RotateSessionOccupant(
+		state,
+		"urn:moos:session:sam.hp-laptop",
+		"urn:moos:agent:claude-code.hp-z440",
+		"actor",
+		"urn:moos:rel:unrelated.something", // collides with unrelated relation
+	)
+	if err == nil || !strings.Contains(err.Error(), "already exists in state") {
+		t.Fatalf("expected collision rejection against unrelated relation; got %v", err)
+	}
+}
+
+// TestRotateSessionOccupant_EmptyActor closes the Gemini + Copilot concern
+// that the helper previously let an empty actor through — fold would have
+// rejected the emitted envelopes with ErrMissingActor at submission time, a
+// confusing failure path. The helper now fails early.
+func TestRotateSessionOccupant_EmptyActor(t *testing.T) {
+	state := stateForRotation()
+	_, err := RotateSessionOccupant(
+		state,
+		"urn:moos:session:sam.hp-laptop",
+		"urn:moos:agent:claude-code.hp-z440",
+		"", // empty actor — now rejected up front
+		"urn:moos:rel:new",
+	)
+	if err == nil || !strings.Contains(err.Error(), "actor is empty") {
+		t.Fatalf("expected 'actor is empty' rejection; got %v", err)
 	}
 }

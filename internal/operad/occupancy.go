@@ -243,13 +243,18 @@ type RotateOccupantResult struct {
 //
 // Failure modes (all return a non-nil error; Envelopes is nil):
 //   - sessionURN empty
-//   - session node missing from state OR not of type_id == "session"
 //   - newOccupantURN empty
+//   - newRelationURN empty
+//   - actor empty (fold.validateEnvelopeStructure would reject the emitted
+//     envelopes with ErrMissingActor; fail early here for a clearer error)
+//   - session node missing from state OR not of type_id == "session"
 //   - newOccupantURN not of a principal type (user | agent)
 //   - current occupant equals newOccupantURN (no-op rotation rejected to
 //     surface programmer bugs; callers who want idempotence check first)
 //   - session has MORE THAN ONE has-occupant relation (doctrine violation;
 //     rotation requires a pre-rotation cleanup pass)
+//   - newRelationURN already exists in state (relation-URN reuse; would
+//     LINK-fail with ErrRelationExists at apply time)
 //
 // On success with an unoccupied session, the program is a single LINK
 // envelope — an "initial seat" rather than a rotation in the strict sense,
@@ -258,9 +263,9 @@ type RotateOccupantResult struct {
 //
 // newRelationURN is the URN for the NEW has-occupant relation. Callers
 // generate it with whatever convention suits them (a conventional shape is
-// urn:moos:rel:<session-short>.has-occupant.<occupant-short>). It must
-// differ from PriorRelationURN (enforced to catch accidental URN reuse
-// that would LINK-fail with ErrRelationExists post-UNLINK-idempotent-skip).
+// urn:moos:rel:<session-short>.has-occupant.<occupant-short>). It must not
+// collide with any existing relation in state — not just PriorRelationURN —
+// to avoid ErrRelationExists at apply time.
 func RotateSessionOccupant(
 	state graph.GraphState,
 	sessionURN graph.URN,
@@ -278,6 +283,13 @@ func RotateSessionOccupant(
 	}
 	if newRelationURN == "" {
 		return zero, rotateErr("newRelationURN is empty")
+	}
+	// actor must be non-empty: fold.validateEnvelopeStructure rejects empty
+	// Actor with ErrMissingActor, so a helper that let empty actor through
+	// would build a "successful" program that deterministically fails at
+	// submission time. Fail here for a clearer error path.
+	if actor == "" {
+		return zero, rotateErr("actor is empty")
 	}
 
 	sessionNode, ok := state.Nodes[sessionURN]
@@ -299,6 +311,7 @@ func RotateSessionOccupant(
 
 	// Gather all has-occupant relations outbound from the session. More than
 	// one is a doctrine violation (§M19 at-most-one); zero is unoccupied.
+	// Early-break on the second match — we only need to distinguish 0 / 1 / >1.
 	var priorRelURN graph.URN
 	var priorOccupant graph.URN
 	count := 0
@@ -311,6 +324,9 @@ func RotateSessionOccupant(
 			continue
 		}
 		count++
+		if count > 1 {
+			break
+		}
 		priorRelURN = rel.URN
 		priorOccupant = rel.TgtURN
 	}
@@ -327,8 +343,12 @@ func RotateSessionOccupant(
 			sessionURN, newOccupantURN)
 	}
 
-	if priorRelURN == newRelationURN {
-		return zero, rotateErr("newRelationURN %s collides with prior relation URN; pick a distinct URN for the new LINK",
+	// Stronger than priorRelURN comparison: reject if newRelationURN matches
+	// ANY existing relation. Catches URN reuse across unrelated relations
+	// (which would cause ErrRelationExists at LINK apply time with a less
+	// informative message) in addition to the prior-has-occupant case.
+	if _, exists := state.Relations[newRelationURN]; exists {
+		return zero, rotateErr("newRelationURN %s already exists in state; pick a distinct URN for the new LINK",
 			newRelationURN)
 	}
 

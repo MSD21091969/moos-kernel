@@ -1,6 +1,10 @@
 package operad
 
-import "moos/kernel/internal/graph"
+import (
+	"fmt"
+
+	"moos/kernel/internal/graph"
+)
 
 // Session-occupancy and admin-capability helpers (§M11 / §M12 / §M19).
 //
@@ -30,6 +34,15 @@ import "moos/kernel/internal/graph"
 // seeds this node (or an admin creates it via governance_proposal); the
 // admin-capability check walks WF02 governs relations into it.
 const superadminRoleURN graph.URN = "urn:moos:role:superadmin"
+
+// hasOccupantSrcPort / isOccupantOfTgtPort are the canonical v3.10 WF19
+// port pair for §M19 session-occupancy. Kept as named constants so helpers
+// (ResolveSessionOccupant, RotateSessionOccupant) and tests all spell them
+// the same way.
+const (
+	hasOccupantSrcPort   = "has-occupant"
+	isOccupantOfTgtPort  = "is-occupant-of"
+)
 
 // principalTypes enumerates the node type_ids that may act as a principal
 // in the §M12 chain. Any other type_id on the actor (or on the resolved
@@ -83,7 +96,7 @@ func ResolveSessionOccupant(state graph.GraphState, sessionURN graph.URN) (graph
 		}
 		// Match on BOTH sides of the WF19 port pair to avoid false positives
 		// from any future WF that reuses one of the port names.
-		if rel.SrcPort != "has-occupant" || rel.TgtPort != "is-occupant-of" {
+		if rel.SrcPort != hasOccupantSrcPort || rel.TgtPort != isOccupantOfTgtPort {
 			continue
 		}
 		tgt, ok := state.Nodes[rel.TgtURN]
@@ -177,4 +190,181 @@ func CheckAdminCapability(state graph.GraphState, actor graph.URN) bool {
 		}
 	}
 	return false
+}
+
+// RotateOccupantResult is the output of RotateSessionOccupant: the atomic
+// program to submit (one or two envelopes), plus metadata useful for logging
+// and test assertions.
+type RotateOccupantResult struct {
+	// Envelopes is the atomic program: an UNLINK of the prior has-occupant
+	// relation followed by a LINK of the new one. When the session is
+	// unoccupied on entry, Envelopes contains only the LINK envelope and
+	// PriorRelationURN is empty. The caller submits the slice via
+	// runtime.ApplyProgram — atomicity is the caller's responsibility (the
+	// helper is pure and does not touch state).
+	Envelopes []graph.Envelope
+
+	// PriorRelationURN is the URN of the has-occupant relation that was
+	// UNLINKed, or "" if the session was unoccupied on entry.
+	PriorRelationURN graph.URN
+
+	// PriorOccupant is the URN of the occupant that was rotated out, or ""
+	// if the session was unoccupied on entry.
+	PriorOccupant graph.URN
+}
+
+// RotateSessionOccupant builds an atomic program that rotates the §M19
+// has-occupant relation on sessionURN from its current occupant (if any) to
+// newOccupantURN. The helper is pure — it only reads state and emits
+// envelopes. The caller is responsible for submitting the returned program
+// via runtime.ApplyProgram so UNLINK+LINK land atomically.
+//
+// DOCTRINE NOTE — rotation as two envelopes, not one:
+//
+// The v3.12 ontology description of the has-occupant additional_port_pair
+// declares "Rotation = MUTATE of the LINK's target_urn (atomic; preserves
+// session identity per CI-3)". MUTATE envelopes in the current kernel model
+// target nodes only (env.TargetURN is a node URN; relations carry no
+// mutable properties). Rather than introduce a fifth rewrite operation or
+// overload MUTATE with a relation path, rotation is realized as an atomic
+// UNLINK + LINK program on the same (SrcURN, WF19 port pair) — which
+// preserves the invariant the ontology description intends:
+//
+//   - Session identity is unchanged (sessionURN is fixed across the program).
+//   - At the atomic boundary, has-occupant points at exactly one target
+//     (either the prior one pre-commit or newOccupantURN post-commit; no
+//     intermediate state where both or neither is visible to readers).
+//   - §M19 "at-most-one has-occupant per session" (D22.2) is preserved.
+//
+// If Guido's review of the ontology description prefers a literal "MUTATE
+// target_urn on a LINK" operation, a follow-up PR can add that as a fifth
+// rewrite_type or extend MUTATE with a RelationURN discriminator. For now
+// rotation is a helper-emitted 2-envelope program.
+//
+// Failure modes (all return a non-nil error; Envelopes is nil):
+//   - sessionURN empty
+//   - session node missing from state OR not of type_id == "session"
+//   - newOccupantURN empty
+//   - newOccupantURN not of a principal type (user | agent)
+//   - current occupant equals newOccupantURN (no-op rotation rejected to
+//     surface programmer bugs; callers who want idempotence check first)
+//   - session has MORE THAN ONE has-occupant relation (doctrine violation;
+//     rotation requires a pre-rotation cleanup pass)
+//
+// On success with an unoccupied session, the program is a single LINK
+// envelope — an "initial seat" rather than a rotation in the strict sense,
+// but the helper covers this case because callers at session-birth time
+// should not need to dispatch to a different helper.
+//
+// newRelationURN is the URN for the NEW has-occupant relation. Callers
+// generate it with whatever convention suits them (a conventional shape is
+// urn:moos:rel:<session-short>.has-occupant.<occupant-short>). It must
+// differ from PriorRelationURN (enforced to catch accidental URN reuse
+// that would LINK-fail with ErrRelationExists post-UNLINK-idempotent-skip).
+func RotateSessionOccupant(
+	state graph.GraphState,
+	sessionURN graph.URN,
+	newOccupantURN graph.URN,
+	actor graph.URN,
+	newRelationURN graph.URN,
+) (RotateOccupantResult, error) {
+	var zero RotateOccupantResult
+
+	if sessionURN == "" {
+		return zero, rotateErr("sessionURN is empty")
+	}
+	if newOccupantURN == "" {
+		return zero, rotateErr("newOccupantURN is empty")
+	}
+	if newRelationURN == "" {
+		return zero, rotateErr("newRelationURN is empty")
+	}
+
+	sessionNode, ok := state.Nodes[sessionURN]
+	if !ok {
+		return zero, rotateErr("session node not found: %s", sessionURN)
+	}
+	if sessionNode.TypeID != "session" {
+		return zero, rotateErr("urn is not a session: %s (type_id=%s)", sessionURN, sessionNode.TypeID)
+	}
+
+	newOccupantNode, ok := state.Nodes[newOccupantURN]
+	if !ok {
+		return zero, rotateErr("new occupant node not found: %s", newOccupantURN)
+	}
+	if _, isPrincipal := principalTypes[newOccupantNode.TypeID]; !isPrincipal {
+		return zero, rotateErr("new occupant %s has type_id=%s, must be user|agent",
+			newOccupantURN, newOccupantNode.TypeID)
+	}
+
+	// Gather all has-occupant relations outbound from the session. More than
+	// one is a doctrine violation (§M19 at-most-one); zero is unoccupied.
+	var priorRelURN graph.URN
+	var priorOccupant graph.URN
+	count := 0
+	for _, relURN := range state.RelationsFrom(sessionURN) {
+		rel, ok := state.Relations[relURN]
+		if !ok {
+			continue
+		}
+		if rel.SrcPort != hasOccupantSrcPort || rel.TgtPort != isOccupantOfTgtPort {
+			continue
+		}
+		count++
+		priorRelURN = rel.URN
+		priorOccupant = rel.TgtURN
+	}
+	if count > 1 {
+		return zero, rotateErr("session %s has %d has-occupant relations (§M19 at-most-one violation); cleanup required before rotation",
+			sessionURN, count)
+	}
+
+	// No-op rotation: same occupant as current. Surface as an error so the
+	// caller can decide whether to treat it as a bug or a benign skip; the
+	// helper does not silently succeed.
+	if count == 1 && priorOccupant == newOccupantURN {
+		return zero, rotateErr("session %s already occupied by %s (rotation is a no-op)",
+			sessionURN, newOccupantURN)
+	}
+
+	if priorRelURN == newRelationURN {
+		return zero, rotateErr("newRelationURN %s collides with prior relation URN; pick a distinct URN for the new LINK",
+			newRelationURN)
+	}
+
+	linkEnv := graph.Envelope{
+		RewriteType:     graph.LINK,
+		Actor:           actor,
+		RelationURN:     newRelationURN,
+		SrcURN:          sessionURN,
+		SrcPort:         hasOccupantSrcPort,
+		TgtURN:          newOccupantURN,
+		TgtPort:         isOccupantOfTgtPort,
+		RewriteCategory: graph.WF19,
+	}
+
+	if count == 0 {
+		// Unoccupied session — initial seat. Single-envelope program.
+		return RotateOccupantResult{
+			Envelopes: []graph.Envelope{linkEnv},
+		}, nil
+	}
+
+	unlinkEnv := graph.Envelope{
+		RewriteType:     graph.UNLINK,
+		Actor:           actor,
+		RelationURN:     priorRelURN,
+		RewriteCategory: graph.WF19,
+	}
+	return RotateOccupantResult{
+		Envelopes:        []graph.Envelope{unlinkEnv, linkEnv},
+		PriorRelationURN: priorRelURN,
+		PriorOccupant:    priorOccupant,
+	}, nil
+}
+
+// rotateErr wraps a rotation-failure message with an "operad:" prefix so it
+// reads uniformly with other operad validation errors in logs.
+func rotateErr(format string, args ...any) error {
+	return fmt.Errorf("operad: rotate_session_occupant: "+format, args...)
 }

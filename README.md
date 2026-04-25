@@ -23,10 +23,10 @@ The session is the centerpiece. A session is a 5-facet scoped context — `(scop
 |---|---|---|
 | `internal/graph` | pure types | `Node`, `Relation`, `Property`, `Rewrite`, `Envelope`, `GraphState` (with indexes), `URN`, `Stratum`, `RewriteCategory`. No IO. |
 | `internal/fold` | pure catamorphism | `Evaluate`, `Replay`, `EvaluateProgram`. Maintains state indexes on ADD/LINK/UNLINK. |
-| `internal/operad` | type system | `Registry` (ontology v3.13.0: 52 node types, 21 WFs WF01–WF21), strict port-pair `ValidateLINK`, `ValidateMUTATE`, occupancy resolution, admin-capability walks. |
+| `internal/operad` | type system | `Registry` (ontology v3.13.0: 52 node types; WFs WF01–WF20 promoted, WF21 proposed in v3.14 candidate set; current typed `RewriteCategory` constants in `internal/graph` run through WF19), strict port-pair `ValidateLINK`, `ValidateMUTATE`, occupancy resolution, admin-capability walks. |
 | `internal/kernel` | effect layer | `Runtime`, `Store`, `LogStore`/`MemStore`. §M11 session-liveness + §M12 admin-capability gates. Sweep loop emits WF13 governance proposals on `t_hook.firing_state` transitions. |
 | `internal/reactive` | predicate evaluator | Watch / React / Guard engine; `EvaluateThookPredicate` covers 10+ §M14 predicate kinds. |
-| `internal/transport` | HTTP + SSE | `/state`, `/log`, `/rewrites`, `/programs`, `/operad`, `/hdc`, `/t-hook/evaluate`, `/t-cone`, `/twin/ingest`, `/fold` (with SSE), `/healthz`. |
+| `internal/transport` | HTTP + SSE | `/state/*` (e.g. `/state/nodes`, `/state/relations`), `/log`, `/rewrites`, `/programs`, `/operad/*` (e.g. `/operad/node-types`), `/hdc/*`, `/t-hook/evaluate`, `/t-cone`, `/twin/ingest`, `/fold` (with SSE), `/healthz`. |
 | `internal/hdc` | hyperdimensional computing | spectral, fiber, crosswalk, encode, live-index. |
 | `internal/mcp` | MCP JSON-RPC | SSE + stdio + Streamable HTTP. |
 
@@ -47,14 +47,14 @@ Key flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--ontology` | (none) | path to `ontology.json`; without it, type validation + liveness/admin gates bypass |
+| `--ontology` | (none) | path to `ontology.json`; without it, ontology-backed type validation is disabled (the runtime falls back to an empty registry); §M11 + §M12 gates still run |
 | `--log` | (none) | JSONL log path; in-memory if omitted |
 | `--listen` | `:8000` | HTTP transport |
 | `--mcp-addr` | `:8080` | MCP SSE |
 | `--sweep-interval` | `30s` | t-hook sweep cadence (0 disables) |
 | `--quic-addr` | (none) | UDP/HTTP3 listener (requires `--tls-cert` + `--tls-key`) |
 
-Stdlib-only except `quic-go` (gated behind `--quic-addr`).
+Direct dependencies are stdlib-only except `quic-go` (gated behind `--quic-addr`); transitive dependencies include `golang.org/x/net` and `golang.org/x/crypto` via `quic-go`.
 
 ## Testing
 
@@ -89,7 +89,7 @@ Twin kernels ride the same hypervisor host via `twin_link` edges and the WF16 ro
 
 ## Status
 
-Round-11 closed (T=174 ~24:00 CEST). Round-12 active (T=175): five v3.14 grammar_fragment proposals expanding the ontology with `derivation` (reify session inference), `clock` (generalized time fabric — `t_hook` becomes a special case), WF21 `causes/caused-by` (causation distinct from succession), `substrate` property (where node-truth lives), and leaf-firing-state semantics.
+Round-11 closed at T=174 (April 24, 2026, just past midnight CEST). Round-12 active (T=175): five v3.14 grammar_fragment proposals expanding the ontology with `derivation` (reify session inference), `clock` (generalized time fabric — `t_hook` becomes a special case), WF21 `causes/caused-by` (causation distinct from succession), `substrate` property (where node-truth lives), and leaf-firing-state semantics.
 
 MVP target: T=190 (May 10, 2026) — six gates (G1–G6) toward `purpose:sam.mvp-sovereign-knowledge-os`.
 

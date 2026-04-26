@@ -142,6 +142,11 @@ func (rt *Runtime) applyWithOptions(env graph.Envelope, opts applyOptions) (grap
 		if err := rt.registry.ValidateStrataLink(env, rt.state); err != nil {
 			return graph.EvalResult{}, err
 		}
+		// WF21 (round-15 v314-3-wf21-causes) acyclicity check. Other LINK
+		// rewrite-categories pass through; only WF21 enforces DAG semantics.
+		if err := rt.registry.ValidateCausalAcyclic(env, rt.state); err != nil {
+			return graph.EvalResult{}, err
+		}
 	}
 
 	// Gate check (M8): fail-closed if any gate node guards the affected node and its predicate fails.
@@ -248,6 +253,12 @@ func (rt *Runtime) ApplyProgram(envelopes []graph.Envelope) ([]graph.EvalResult,
 		// Strata enforcement (M5) + Gate check (M8) against the working state.
 		if env.RewriteType == graph.LINK && rt.registry != nil {
 			if err := rt.registry.ValidateStrataLink(env, workingState); err != nil {
+				return nil, err
+			}
+			// WF21 acyclicity (round-15) checked against working state so
+			// intra-batch causes-LINKs can't close a cycle even when
+			// individual envelopes pass against pre-batch state.
+			if err := rt.registry.ValidateCausalAcyclic(env, workingState); err != nil {
 				return nil, err
 			}
 		}

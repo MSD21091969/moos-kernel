@@ -375,3 +375,71 @@ func containsTypeID(list []graph.TypeID, id graph.TypeID) bool {
 	}
 	return false
 }
+
+// ValidateCausalAcyclic enforces WF21 (causes/caused-by) acyclicity for LINK
+// rewrites. Called with the kernel read-lock held (state is consistent), in
+// the same apply path as ValidateStrataLink.
+//
+// When a new LINK src --causes--> tgt is proposed, walk forward through
+// existing causes-edges starting from tgt. If we reach src, the new LINK
+// would close a cycle in the causes/caused-by DAG and is rejected.
+//
+// Rules:
+//  1. Non-WF21 LINKs pass through (no acyclicity constraint applies).
+//  2. Non-LINK rewrites (UNLINK, ADD, MUTATE) pass through.
+//  3. Self-LINK (src == tgt) is a 1-cycle and is rejected immediately.
+//  4. BFS forward from tgt through outgoing edges where RewriteCategory=WF21
+//     and SrcPort="causes" (i.e., true causes-direction edges, not the
+//     reverse caused-by side of the same relation). If env.SrcURN is
+//     reached, reject.
+//
+// Round-15 ceremony (T=176): introduced as v314-3-wf21-causes promotion
+// companion. Pairs with v314-2-clock-type and v314-4-substrate-property.
+// Doctrine anchor: kb/research/spec/07-time-fabric.md §7.3.5 +
+// kb/research/spec/05-external-substrates.md §5.1.5/§5.3.5.
+func (r *Registry) ValidateCausalAcyclic(env graph.Envelope, state graph.GraphState) error {
+	if env.RewriteType != graph.LINK {
+		return nil
+	}
+	if env.RewriteCategory != graph.RewriteCategory("WF21") {
+		return nil
+	}
+	if env.SrcURN == env.TgtURN {
+		return fmt.Errorf("WF21 acyclic: self-LINK %s --causes--> %s would create a 1-cycle",
+			env.SrcURN, env.TgtURN)
+	}
+
+	// BFS forward from tgt along outgoing WF21 causes-edges. If we reach src,
+	// the new edge src --causes--> tgt would close a cycle.
+	visited := map[graph.URN]bool{env.TgtURN: true}
+	queue := []graph.URN{env.TgtURN}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for relURN := range state.RelationsBySrc[cur] {
+			rel, ok := state.Relations[relURN]
+			if !ok {
+				continue
+			}
+			if rel.RewriteCategory != graph.RewriteCategory("WF21") {
+				continue
+			}
+			// Only follow edges in the canonical causes-direction. The
+			// reverse caused-by side of the same relation is implicit
+			// in WF21's port-pair (causes / caused-by) — walking that
+			// direction would over-detect.
+			if rel.SrcPort != "causes" {
+				continue
+			}
+			if rel.TgtURN == env.SrcURN {
+				return fmt.Errorf("WF21 acyclic: adding %s --causes--> %s would close a cycle (path exists: %s --causes...--> %s)",
+					env.SrcURN, env.TgtURN, env.TgtURN, env.SrcURN)
+			}
+			if !visited[rel.TgtURN] {
+				visited[rel.TgtURN] = true
+				queue = append(queue, rel.TgtURN)
+			}
+		}
+	}
+	return nil
+}
